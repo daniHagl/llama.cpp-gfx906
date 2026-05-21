@@ -8,7 +8,7 @@
 [![Docker](https://github.com/ggml-org/llama.cpp/actions/workflows/docker.yml/badge.svg)](https://github.com/ggml-org/llama.cpp/actions/workflows/docker.yml)
 [![Winget](https://github.com/ggml-org/llama.cpp/actions/workflows/winget.yml/badge.svg)](https://github.com/ggml-org/llama.cpp/actions/workflows/winget.yml)
 
-Community llama.cpp fork — everything from MI50/gfx906 support, ruquant quantization, reasoning grammar fixes, to persistent KV cache checkpoint DB.
+Community llama.cpp fork — MI50/gfx906 support, reasoning grammar fixes, persistent KV cache checkpoint DB.
 
 Join the community: [https://discord.gg/jGY5PqNq7](https://discord.gg/jGY5PqNq7)
 
