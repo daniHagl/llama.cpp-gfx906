@@ -1,4 +1,4 @@
-# llama.cpp
+# llama.cpp-gfx906
 
 ![llama](https://user-images.githubusercontent.com/1991296/230134379-7181e485-c521-4d23-a0d6-f7b3b61ba524.png)
 
@@ -8,9 +8,17 @@
 [![Docker](https://github.com/ggml-org/llama.cpp/actions/workflows/docker.yml/badge.svg)](https://github.com/ggml-org/llama.cpp/actions/workflows/docker.yml)
 [![Winget](https://github.com/ggml-org/llama.cpp/actions/workflows/winget.yml/badge.svg)](https://github.com/ggml-org/llama.cpp/actions/workflows/winget.yml)
 
-[Manifesto](https://github.com/ggml-org/llama.cpp/discussions/205) / [ggml](https://github.com/ggml-org/ggml) / [ops](https://github.com/ggml-org/llama.cpp/blob/master/docs/ops.md)
+llama.cpp fork for **AMD MI50 (gfx906)** with additional features.
 
-LLM inference in C/C++
+## Feature Branches
+
+| Branch | Description |
+|---|---|
+| [`checkpoint-db`](https://github.com/skyne98/llama.cpp-gfx906/tree/checkpoint-db) | Persistent two-tier (RAM + disk) checkpoint DB — KV cache state indexed by token prefix via a trie. Survives server restarts, automatically searches on cache miss. `--cache-db-path /path --cache-db-ram N --cache-db-disk N` |
+| [`reasoning-grammar`](https://github.com/skyne98/llama.cpp-gfx906/tree/reasoning-grammar) | Catch-all tool parser with empty arguments fix |
+| [`ruquant-w4a4`](https://github.com/skyne98/llama.cpp-gfx906/tree/ruquant-w4a4) | C++ atomics compat for ggml-cpu, ruquant quantization support |
+
+**`gfx906`** is the integration branch — all features above are merged here for MI50 deployment.
 
 ## Recent API changes
 
