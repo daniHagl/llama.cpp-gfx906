@@ -1168,6 +1168,21 @@ private:
             db_cfg.ram_capacity_mib = params_base.cache_db_ram_mib > 0 ? (uint64_t)params_base.cache_db_ram_mib : 0;
             db_cfg.disk_capacity_mib = params_base.cache_db_disk_mib > 0 ? (uint64_t)params_base.cache_db_disk_mib : 0;
             ckpt_db = std::make_unique<checkpoint_db>(db_cfg);
+
+            // model identity fingerprint — checkpoints only match same model + params
+            {
+                char desc_buf[128] = {};
+                llama_model_desc(model_tgt, desc_buf, sizeof(desc_buf));
+                std::string fp;
+                fp += desc_buf;
+                fp += "|path:" + params_base.model.path;
+                fp += "|ctx:" + std::to_string(n_ctx);
+                fp += "|kv_k:" + std::to_string((int)params_base.cache_type_k);
+                fp += "|kv_v:" + std::to_string((int)params_base.cache_type_v);
+                ckpt_db->set_model_id(fp);
+                SRV_INF("checkpoint DB model_id = %s\n", fp.c_str());
+            }
+
             ckpt_db->load_manifest();
             SRV_INF("checkpoint DB enabled at '%s' (%d MiB RAM, %d MiB disk)\n",
                     params_base.cache_db_path.c_str(),

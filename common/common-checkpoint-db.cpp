@@ -12,9 +12,11 @@
 
 namespace fs = std::filesystem;
 
-// --- manifest binary format ---
+// --- manifest binary format (version 2) ---
 // uint32_t magic        = 0xDBDBDBDB
-// uint32_t version      = 1
+// uint32_t version      = 2
+// uint32_t model_id_len  // number of bytes in model_id string (0 = no model keying)
+// uint8_t[model_id_len] // model fingerprint string
 // uint32_t n_entries
 // for each entry:
 //   uint32_t id
@@ -29,11 +31,14 @@ namespace fs = std::filesystem;
 //     int32_t  ckpt_pos_max
 //     uint64_t ckpt_tgt_size
 //     uint64_t ckpt_dft_size
-//   uint64_t disk_offset   // offset in .kv file where blobs start
-//   uint32_t disk_size     // total bytes of blobs
+//   uint64_t disk_offset
+//   uint32_t disk_size
+//
+// version 1 manifests (no model_id) are discarded on load — unsafe to reuse
+// across different models.
 
 static const uint32_t MANIFEST_MAGIC   = 0xDBDBDBDB;
-static const uint32_t MANIFEST_VERSION = 1;
+static const uint32_t MANIFEST_VERSION = 2;
 
 // helpers
 static void write_u32(std::ofstream & os, uint32_t v) { os.write(reinterpret_cast<const char*>(&v), sizeof(v)); }
@@ -85,8 +90,26 @@ void checkpoint_db::load_manifest() {
     }
 
     const auto version = read_u32(is);
-    if (version != MANIFEST_VERSION) {
+    if (version < 1 || version > MANIFEST_VERSION) {
         LOG_WRN("checkpoint_db: unsupported manifest version %u, ignoring\n", version);
+        return;
+    }
+
+    // version 2+: read model_id, skip entirely if mismatched
+    if (version >= 2) {
+        const auto mid_len = read_u32(is);
+        std::string manifest_mid;
+        if (mid_len > 0) {
+            manifest_mid.resize(mid_len);
+            is.read(&manifest_mid[0], mid_len);
+        }
+        if (!model_id_.empty() && manifest_mid != model_id_) {
+            LOG_WRN("checkpoint_db: model mismatch, discarding all %u entries\n", read_u32(is));
+            return;
+        }
+    } else if (!model_id_.empty()) {
+        // version 1 has no model_id — discard if we have a model identity
+        LOG_WRN("checkpoint_db: discarding v1 manifest (no model_id, current model=%.32s)\n", model_id_.c_str());
         return;
     }
 
@@ -270,6 +293,11 @@ void checkpoint_db::write_manifest() {
 
     write_u32(os, MANIFEST_MAGIC);
     write_u32(os, MANIFEST_VERSION);
+    // version 2: write model_id for cross-model safety
+    write_u32(os, static_cast<uint32_t>(model_id_.size()));
+    if (!model_id_.empty()) {
+        os.write(model_id_.data(), model_id_.size());
+    }
     write_u32(os, static_cast<uint32_t>(entries_.size()));
 
     for (const auto & e : entries_) {

@@ -32,7 +32,14 @@ public:
     checkpoint_db(const checkpoint_db_config & cfg);
     ~checkpoint_db();
 
+    // set model identity — checkpoints from different models will not match
+    // call once at server startup after model is loaded
+    // fingerprint should encode model architecture, path, context size, and any
+    // inference params that affect KV cache layout
+    void set_model_id(const std::string & id) { model_id_ = id; }
+
     // rebuild trie from disk manifest (call on server startup after model load)
+    // entries with a non-matching model_id are silently skipped
     void load_manifest();
 
     // store a new prefix-KV mapping (call after prompt_save)
@@ -80,6 +87,7 @@ private:
     };
 
     checkpoint_db_config cfg_;
+    std::string model_id_;               // model fingerprint — mismatches cause eviction
     std::unique_ptr<trie_node> root_;
     std::vector<std::unique_ptr<entry>> entries_;
     std::list<entry*> lru_;
