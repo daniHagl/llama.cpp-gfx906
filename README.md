@@ -8,7 +8,9 @@
 [![Docker](https://github.com/ggml-org/llama.cpp/actions/workflows/docker.yml/badge.svg)](https://github.com/ggml-org/llama.cpp/actions/workflows/docker.yml)
 [![Winget](https://github.com/ggml-org/llama.cpp/actions/workflows/winget.yml/badge.svg)](https://github.com/ggml-org/llama.cpp/actions/workflows/winget.yml)
 
-llama.cpp fork for **AMD MI50 (gfx906)** with additional features.
+Community llama.cpp fork — everything from MI50/gfx906 support, ruquant quantization, reasoning grammar fixes, to persistent KV cache checkpoint DB.
+
+Join the community: [https://discord.gg/jGY5PqNq7](https://discord.gg/jGY5PqNq7)
 
 ## Feature Branches
 
@@ -18,7 +20,7 @@ llama.cpp fork for **AMD MI50 (gfx906)** with additional features.
 | [`reasoning-grammar`](https://github.com/skyne98/llama.cpp-gfx906/tree/reasoning-grammar) | Catch-all tool parser with empty arguments fix |
 | [`ruquant-w4a4`](https://github.com/skyne98/llama.cpp-gfx906/tree/ruquant-w4a4) | C++ atomics compat for ggml-cpu, ruquant quantization support |
 
-**`gfx906`** is the integration branch — all features above are merged here for MI50 deployment.
+**`gfx906`** is the integration branch — all features above are merged here. Contributions by skyne98 and co.
 
 ## Recent API changes
 
