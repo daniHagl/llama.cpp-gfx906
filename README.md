@@ -16,11 +16,62 @@ Join the community: [https://discord.gg/jGY5PqNq7](https://discord.gg/jGY5PqNq7)
 
 | Branch | Description |
 |---|---|
-| [`checkpoint-db`](https://github.com/skyne98/llama.cpp-gfx906/tree/checkpoint-db) | Persistent two-tier (RAM + disk) checkpoint DB — KV cache state indexed by token prefix via a trie. Survives server restarts, automatically searches on cache miss. `--cache-db-path /path --cache-db-ram N --cache-db-disk N` |
-| [`reasoning-grammar`](https://github.com/skyne98/llama.cpp-gfx906/tree/reasoning-grammar) | Catch-all tool parser with empty arguments fix |
-| [`ruquant-w4a4`](https://github.com/skyne98/llama.cpp-gfx906/tree/ruquant-w4a4) | C++ atomics compat for ggml-cpu, ruquant quantization support |
+| [`checkpoint-db`](https://github.com/skyne98/llama.cpp-gfx906/tree/checkpoint-db) | Persistent KV cache checkpoint DB |
+| [`reasoning-grammar`](https://github.com/skyne98/llama.cpp-gfx906/tree/reasoning-grammar) | Structured reasoning via GBNF grammar |
 
-**`gfx906`** is the integration branch — all features above are merged here. Contributions by skyne98 and co.
+**`gfx906`** is the integration branch. Contributions by skyne98 and co.
+
+### `checkpoint-db` — Persistent KV Cache Checkpoint DB
+
+Saves full KV cache state to disk whenever a slot is evicted, indexed by token prefix via a trie. On the next request (even after a server restart), searches all persisted checkpoints for the longest common prefix match and restores the KV state — skipping reprocessing of matching tokens.
+
+```
+--cache-db-path /path/to/db    # enable, create on first use
+--cache-db-ram 4096             # RAM buffer for hot entries (MiB)
+--cache-db-disk 102400          # disk limit (MiB) — survives restarts
+```
+
+Works alongside `--cache-ram`. Exact-match and fork scenarios produce identical output vs cold processing. Multimodal prompts are skipped automatically. Tested with text, speculative decoding (ngram-mod), and Qwen3.5-0.8B vision.
+
+**Example from `~/nixos` (llama-swap config):**
+```
+--cache-ram -1
+--cache-db-path /home/fox/.cache/llama.cpp/checkpoints
+--cache-db-ram 8192
+--cache-db-disk 512000
+```
+
+### `reasoning-grammar` — Structured Thinking via GBNF
+
+GBNF grammar that constrains model thinking output into a parseable structured format, paired with `--reasoning on` and `--grammar-file`. Forces the model to emit a structured reasoning block before the final answer, which downstream tools can parse.
+
+**Grammar (`think.gbnf`):**
+```gbnf
+root ::= "QUERY: " line "\n" "KEYS: " line "\n"
+         "VALUES:\n" values "</think>\n\n" out
+values ::= value-line{1,3}
+value-line ::= "- " line "\n"
+line ::= safe-char{1,240}
+safe-char ::= [a-zA-Z0-9_.,:;!?/() +*='@#\[\]{}<>-]
+out ::= [\x09\x0A\x0D\x20-\x7E]+
+```
+
+**Usage:**
+```
+llama-server \
+  --reasoning on \
+  --grammar-file think.gbnf \
+  --jinja \
+  --chat-template-kwargs '{"enable_thinking":true,"preserve_thinking":true}'
+```
+
+This is used in production with models like `qwen3.6-27b-mtp-ud-q3_k_xl` and `qwen3.6-35b-a3b-mtp-iq4_xs` via the NixOS llama-swap gateway (`~/nixos/modules/home/services/ai.nix`). Combined with speculative decoding for latency:
+```
+--spec-type draft-mtp,ngram-mod,ngram-map-k4v
+--spec-draft-n-max 3
+--spec-ngram-mod-n-match 24 --spec-ngram-mod-n-min 48 --spec-ngram-mod-n-max 64
+--spec-ngram-map-k4v-size-n 16 --spec-ngram-map-k4v-size-m 96 --spec-ngram-map-k4v-min-hits 1
+```
 
 ## Recent API changes
 
