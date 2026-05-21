@@ -1350,6 +1350,27 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_CACHE_RAM").set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}));
     add_opt(common_arg(
+        {"--cache-db-path"}, "PATH",
+        string_format("path for persistent checkpoint DB on disk (default: %s, empty = disabled)", params.cache_db_path.c_str()),
+        [](common_params & params, const std::string & value) {
+            params.cache_db_path = value;
+        }
+    ).set_env("LLAMA_ARG_CACHE_DB_PATH").set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
+        {"--cache-db-ram"}, "N",
+        string_format("max RAM for checkpoint DB in MiB (default: %d)", params.cache_db_ram_mib),
+        [](common_params & params, int value) {
+            params.cache_db_ram_mib = value;
+        }
+    ).set_env("LLAMA_ARG_CACHE_DB_RAM").set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
+        {"--cache-db-disk"}, "N",
+        string_format("max disk for checkpoint DB in MiB (default: %d)", params.cache_db_disk_mib),
+        [](common_params & params, int value) {
+            params.cache_db_disk_mib = value;
+        }
+    ).set_env("LLAMA_ARG_CACHE_DB_DISK").set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
         {"-kvu", "--kv-unified"},
         {"-no-kvu", "--no-kv-unified"},
         "use single unified KV buffer shared across all sequences (default: enabled if number of slots is auto)",

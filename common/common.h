@@ -601,6 +601,11 @@ struct common_params {
     int32_t checkpoint_min_step = 256;   // minimum spacing between context checkpoints
     int32_t cache_ram_mib       = 8192;  // -1 = no limit, 0 - disable, 1 = 1 MiB, etc.
 
+    // persistent checkpoint DB config
+    std::string cache_db_path   = "";    // empty = disk-backed checkpoint DB disabled
+    int32_t cache_db_ram_mib    = 4096;  // max RAM for checkpoint DB (MiB)
+    int32_t cache_db_disk_mib   = 102400; // max disk for checkpoint DB (MiB)
+
     std::string hostname      = "127.0.0.1";
     std::string public_path   = "";                                                                         // NOLINT
     std::string api_prefix    = "";                                                                         // NOLINT

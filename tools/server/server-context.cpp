@@ -7,6 +7,7 @@
 #include "server-queue.h"
 
 #include "build-info.h"
+#include "common-checkpoint-db.h"
 #include "common.h"
 #include "fit.h"
 #include "llama.h"
@@ -660,6 +661,11 @@ public:
     }
 
     ~server_context_impl() {
+        if (ckpt_db) {
+            SRV_INF("%s", "checkpoint DB: flushing on shutdown\n");
+            ckpt_db->flush();
+            ckpt_db.reset();
+        }
         if (!sleeping) {
             // destroy() is already called when entering sleeping state
             // we don't call it again here to avoid double free
@@ -705,6 +711,8 @@ private:
 
     std::unique_ptr<server_prompt_cache> prompt_cache;
 
+    std::unique_ptr<checkpoint_db> ckpt_db;
+
     server_metrics metrics;
 
     json json_ui_settings = json::object();    // Primary: new name
@@ -720,6 +728,13 @@ private:
     bool sleeping = false;
 
     void destroy() {
+        // flush persistent checkpoint DB before tearing down contexts
+        if (ckpt_db) {
+            SRV_INF("%s", "flushing checkpoint DB to disk\n");
+            ckpt_db->flush();
+            ckpt_db.reset();
+        }
+
         spec.reset();
         ctx_dft.reset();
         model_dft.reset();
@@ -742,6 +757,19 @@ private:
         SLT_INF(slot, "%s", "saving idle slot to prompt cache\n");
         SLT_DBG(slot, "%s", "__TEST_TAG_CACHE_IDLE_SLOT__\n");
         slot.prompt_save(*prompt_cache);
+
+        // also persist to checkpoint DB
+        if (ckpt_db && !prompt_cache->states.empty()) {
+            const auto & saved = prompt_cache->states.back();
+            if (!saved.tokens.has_mtmd) {
+                ckpt_db->store(
+                    saved.tokens.get_tokens(),
+                    saved.data.main,
+                    saved.data.drft,
+                    saved.checkpoints);
+            }
+        }
+
         slot.prompt_clear(false);
         prompt_cache->update();
     }
@@ -1132,6 +1160,22 @@ private:
         } else {
             SRV_INF("%s", "context checkpoints disabled\n");
         }
+        
+        // init persistent checkpoint DB
+        if (!params_base.cache_db_path.empty()) {
+            checkpoint_db_config db_cfg;
+            db_cfg.disk_path        = params_base.cache_db_path;
+            db_cfg.ram_capacity_mib = params_base.cache_db_ram_mib > 0 ? (uint64_t)params_base.cache_db_ram_mib : 0;
+            db_cfg.disk_capacity_mib = params_base.cache_db_disk_mib > 0 ? (uint64_t)params_base.cache_db_disk_mib : 0;
+            ckpt_db = std::make_unique<checkpoint_db>(db_cfg);
+            ckpt_db->load_manifest();
+            SRV_INF("checkpoint DB enabled at '%s' (%d MiB RAM, %d MiB disk)\n",
+                    params_base.cache_db_path.c_str(),
+                    params_base.cache_db_ram_mib,
+                    params_base.cache_db_disk_mib);
+        } else {
+            SRV_INF("%s", "checkpoint DB disabled - use `--cache-db-path` to enable\n");
+        }
 
         if (!params_base.model_alias.empty()) {
             // backward compat: use first alias as model name
@@ -1363,9 +1407,70 @@ private:
                 // don't save the slot's state if its context is empty
                 if (tokens.size() > 0) {
                     ret->prompt_save(*prompt_cache);
+
+                    // persist to checkpoint DB
+                    // skip multimodal prompts — they have embedded image tokens that don't survive
+                    // token-only storage; the KV cache data would be stale on restore
+                    if (ckpt_db && !prompt_cache->states.empty()) {
+                        const auto & saved = prompt_cache->states.back();
+                        if (!saved.tokens.has_mtmd) {
+                            ckpt_db->store(
+                                saved.tokens.get_tokens(),
+                                saved.data.main,
+                                saved.data.drft,
+                                saved.checkpoints);
+                            SRV_INF("checkpoint DB: stored %zu tokens, %.3f MiB\n",
+                                    saved.tokens.size(),
+                                    saved.data.size() / (1024.0 * 1024.0));
+                        }
+                    }
                 }
 
-                if (!ret->prompt_load(*prompt_cache, task.tokens)) {
+                // compute LCP from whatever the slot currently has (may be leftover from prior use)
+                int best_lcp = (int)ret->prompt.tokens.get_common_prefix(task.tokens);
+
+                ret->prompt_load(*prompt_cache, task.tokens);
+
+                // check if slot now has a better LCP (from prompt_cache match)
+                int slot_lcp = (int)ret->prompt.tokens.get_common_prefix(task.tokens);
+                if (slot_lcp > best_lcp) {
+                    best_lcp = slot_lcp;
+                }
+
+                // try persistent checkpoint DB for even better match
+                // skip multimodal — checkpoint DB stores text-only KV data
+                bool loaded_from_ckpt = false;
+                if (ckpt_db && !task.tokens.has_mtmd) {
+                    auto db_match = ckpt_db->find(task.tokens.get_tokens());
+                    if (db_match.found && (int)db_match.n_matched > best_lcp) {
+                        SRV_INF("checkpoint DB: found better match at %zu tokens (LCP = %zu, best was %d)\n",
+                                db_match.matched_tokens.size(), db_match.n_matched, best_lcp);
+
+                        const size_t n_main = db_match.kv_main.size();
+                        const size_t n1 = llama_state_seq_set_data_ext(
+                            ctx_tgt, db_match.kv_main.data(), n_main, ret->id, 0);
+                        if (n1 != n_main) {
+                            SRV_ERR("%s", "checkpoint DB: failed to restore main KV state\n");
+                        } else {
+                            if (!db_match.kv_drft.empty() && ctx_dft) {
+                                const size_t n_dft = db_match.kv_drft.size();
+                                const size_t n2 = llama_state_seq_set_data_ext(
+                                    ctx_dft.get(), db_match.kv_drft.data(), n_dft, ret->id, 0);
+                                if (n2 != n_dft) {
+                                    SRV_WRN("%s", "checkpoint DB: failed to restore draft KV state\n");
+                                }
+                            }
+                            ret->prompt.tokens     = server_tokens(db_match.matched_tokens, false);
+                            ret->prompt.data.main   = std::move(db_match.kv_main);
+                            ret->prompt.data.drft   = std::move(db_match.kv_drft);
+                            ret->prompt.checkpoints  = std::move(db_match.checkpoints);
+                            best_lcp = (int)db_match.n_matched;
+                            loaded_from_ckpt = true;
+                        }
+                    }
+                }
+
+                if (!loaded_from_ckpt && best_lcp == 0) {
                     ret->prompt_clear(false);
                 }
 
