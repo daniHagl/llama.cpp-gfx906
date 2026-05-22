@@ -33,10 +33,10 @@ Saves full KV cache state to disk whenever a slot is evicted, indexed by token p
 
 Works alongside `--cache-ram`. Exact-match and fork scenarios produce identical output vs cold processing. Multimodal prompts are skipped automatically. Tested with text, speculative decoding (ngram-mod), and Qwen3.5-0.8B vision.
 
-**Example from `~/nixos` (llama-swap config):**
+**Example with llama-swap:**
 ```
 --cache-ram -1
---cache-db-path /home/fox/.cache/llama.cpp/checkpoints
+--cache-db-path /var/cache/llama.cpp/checkpoints
 --cache-db-ram 8192
 --cache-db-disk 512000
 ```
@@ -65,7 +65,7 @@ llama-server \
   --chat-template-kwargs '{"enable_thinking":true,"preserve_thinking":true}'
 ```
 
-This is used in production with models like `qwen3.6-27b-mtp-ud-q3_k_xl` and `qwen3.6-35b-a3b-mtp-iq4_xs` via the NixOS llama-swap gateway (`~/nixos/modules/home/services/ai.nix`). Combined with speculative decoding for latency:
+Combined with speculative decoding for latency:
 ```
 --spec-type draft-mtp,ngram-mod,ngram-map-k4v
 --spec-draft-n-max 3
