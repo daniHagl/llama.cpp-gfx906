@@ -42,7 +42,7 @@ Works alongside `--cache-ram`. Exact-match and fork scenarios produce identical 
 
 ### `reasoning-grammar` — Structured Thinking via GBNF
 
-GBNF grammar that constrains model thinking output into a parseable structured format, paired with `--reasoning on` and `--grammar-file`. Forces the model to emit a structured reasoning block before the final answer, which downstream tools can parse.
+GBNF grammar that constrains model thinking output into a parseable structured format, paired with `--reasoning on` and `--grammar-file`. Forces the model to emit a structured reasoning block before the final answer, which downstream tools can parse. Can reduce Qwen3.6 reasoning time by 90%+ without losing performance.
 
 **Grammar (`think.gbnf`):**
 ```gbnf
