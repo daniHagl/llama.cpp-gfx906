@@ -33,7 +33,6 @@ Saves full KV cache state to disk whenever a slot is evicted, indexed by token p
 
 Works alongside `--cache-ram`. Exact-match and fork scenarios produce identical output vs cold processing. Multimodal prompts are skipped automatically. Tested with text, speculative decoding (ngram-mod), and Qwen3.5-0.8B vision.
 
-**Example with llama-swap:**
 ```
 --cache-ram -1
 --cache-db-path /var/cache/llama.cpp/checkpoints
