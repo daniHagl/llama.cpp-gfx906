@@ -74,6 +74,9 @@ struct server_slot {
     llama_context * ctx_tgt = nullptr;
     llama_context * ctx_dft = nullptr;
 
+    // set by server_context_impl during slot init; checked before use
+    class checkpoint_db * ckpt_db = nullptr;
+
     // multimodal
     mtmd_context * mctx = nullptr;
 
@@ -380,6 +383,18 @@ struct server_slot {
             t_token_generation = (ggml_time_us() - t_start_generation) / 1e3;
 
             state = SLOT_STATE_IDLE;
+
+            // save to checkpoint DB before clearing — captures every completed request
+            if (ckpt_db && prompt.n_tokens() > 0 && !prompt.tokens.has_mtmd) {
+                const size_t sz = llama_state_seq_get_size_ext(ctx_tgt, id, LLAMA_STATE_SEQ_FLAGS_NONE);
+                if (sz > 0) {
+                    std::vector<uint8_t> kv(sz);
+                    llama_state_seq_get_data_ext(ctx_tgt, kv.data(), sz, id, LLAMA_STATE_SEQ_FLAGS_NONE);
+                    ckpt_db->store(prompt.tokens.get_tokens(), kv, {}, prompt.checkpoints);
+                    SLT_DBG(*this, "saved to checkpoint DB: %zu tokens, %.3f MiB\n",
+                            prompt.tokens.size(), sz / (1024.0 * 1024.0));
+                }
+            }
 
             // do not keep context of the child slots - the parent's context is enough
             if (task->is_child()) {
@@ -1190,6 +1205,11 @@ private:
                     params_base.cache_db_disk_mib);
         } else {
             SRV_INF("%s", "checkpoint DB disabled - use `--cache-db-path` to enable\n");
+        }
+
+        // wire checkpoint DB into slots for auto-save on release
+        for (auto & slot : slots) {
+            slot.ckpt_db = ckpt_db ? ckpt_db.get() : nullptr;
         }
 
         if (!params_base.model_alias.empty()) {
