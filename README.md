@@ -23,22 +23,29 @@ Join the community: [https://discord.gg/jGY5PqNq7](https://discord.gg/jGY5PqNq7)
 
 ### `checkpoint-db` — Persistent KV Cache Checkpoint DB
 
-Saves full KV cache state to disk whenever a slot is evicted, indexed by token prefix via a trie. On the next request (even after a server restart), searches all persisted checkpoints for the longest common prefix match and restores the KV state — skipping reprocessing of matching tokens.
+Saves full KV cache state to disk whenever a request completes, indexed by token prefix via a trie. On the next request (even after a server restart), searches all persisted checkpoints for the longest common prefix match and restores the KV state — skipping reprocessing of matching tokens.
+
+**How the caches work together (searched in order):**
+
+1. **`--cache-ram N`** — existing in-memory prompt cache. Fastest. Lost on restart. Searched first on every request. If the exact prefix is found, KV state is restored from here instantly.
+
+2. **`--checkpoint-db`** — persistent disk-backed DB. Searched as a fallback when the in-memory cache misses. The trie index is in RAM (zero disk I/O for search). If found, KV blob is loaded from disk.
 
 ```
---cache-db-path /path/to/db    # enable, create on first use
---cache-db-ram 4096             # RAM buffer for hot entries (MiB)
---cache-db-disk 102400          # disk limit (MiB) — survives restarts
+# Tier 1: fast in-memory cache for active prompts
+--cache-ram 4096
+
+# Tier 2: persistent disk-backed cache for cross-session reuse
+--cache-db-path /path/to/db    # enable
+--cache-db-ram 2048             # RAM buffer for hot entries (faster than disk)
+--cache-db-disk 512000          # disk limit (MiB) — survives restarts
 ```
 
-Works alongside `--cache-ram`. Exact-match and fork scenarios produce identical output vs cold processing. Multimodal prompts are skipped automatically. Tested with text, speculative decoding (ngram-mod), and Qwen3.5-0.8B vision.
+`--cache-db-ram` is a hot cache for the persistent DB, NOT a separate cache. Entries in the RAM buffer are served without disk I/O. LRU eviction spills cold entries to disk. Without it, all DB lookups hit disk.
 
-```
---cache-ram -1
---cache-db-path /var/cache/llama.cpp/checkpoints
---cache-db-ram 8192
---cache-db-disk 512000
-```
+Model identity keying: checkpoints are tagged with a fingerprint of model architecture, file path, context size, and KV cache quantization. Swapping models silently discards stale entries.
+
+Exact-match and fork scenarios produce identical output vs cold processing. Multimodal prompts skipped automatically. Tested with text, speculative decoding (ngram-mod), and Qwen3.5-0.8B vision.
 
 ### `reasoning-grammar` — Structured Thinking via GBNF
 
