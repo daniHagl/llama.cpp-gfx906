@@ -129,12 +129,6 @@ set_target_properties(${TARGET} PROPERTIES
 )
 
 target_include_directories(${TARGET} PUBLIC . ../vendor)
-
-# xxhash for content-addressed chunk storage
-set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -I../examples/gguf-hash/deps/xxhash")
-set_source_files_properties(../examples/gguf-hash/deps/xxhash/xxhash.c PROPERTIES LANGUAGE C)
-target_sources(${TARGET} PRIVATE ../examples/gguf-hash/deps/xxhash/xxhash.c)
-target_include_directories(${TARGET} PRIVATE ../examples/gguf-hash/deps/xxhash)
 target_compile_features   (${TARGET} PUBLIC cxx_std_17)
 
 if (BUILD_SHARED_LIBS)
