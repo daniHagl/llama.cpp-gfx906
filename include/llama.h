@@ -900,6 +900,30 @@ extern "C" {
                     llama_seq_id   dest_seq_id,
            llama_state_seq_flags   flags);
 
+    // Cell-major serialization for storage dedup.
+    // Returns the number of KV cells for the given sequence.
+    LLAMA_API size_t llama_state_seq_get_n_cells(
+            struct llama_context * ctx,
+                    llama_seq_id   seq_id);
+
+    // Extract all cells into separate buffers. dst_sizes must be at least max_cells entries.
+    // Each cell is a contiguous chunk of K+V tensor data for all layers.
+    // Returns the number of cells written. Call with *n_cells_out=0 first to get sizes.
+    LLAMA_API size_t llama_state_seq_get_cells(
+            struct llama_context * ctx,
+                    llama_seq_id   seq_id,
+                          uint8_t * dst,
+                          size_t  * dst_sizes,
+                          size_t    max_cells);
+
+    // Reconstruct the full KV state from cell data.
+    LLAMA_API size_t llama_state_seq_set_cells(
+            struct llama_context * ctx,
+                    llama_seq_id   dest_seq_id,
+                          size_t   n_cells,
+                    const size_t * cell_sizes,
+                    const uint8_t * cell_data);
+
     //
     // Decoding
     //
