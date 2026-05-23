@@ -94,10 +94,6 @@ private:
     uint32_t next_id_    = 1;
 
     static uint64_t hash_bytes(const uint8_t * data, size_t len);
-    static std::vector<uint8_t> reconstruct_blob(
-        const std::vector<uint8_t> & header,
-        const std::vector<cell_ref> & cells,
-        const uint8_t * cell_data_buf);
     std::string cell_path(uint64_t hash) const;
     void write_cell(uint64_t hash, const uint8_t * data, size_t len);
     bool read_cell(uint64_t hash, uint8_t * out, size_t len) const;

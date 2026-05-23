@@ -3914,95 +3914,10 @@ size_t llama_state_seq_load_file(llama_context * ctx, const char * filepath, lla
     }
 }
 
-// --- cell-major API ---
-
-static uint32_t ru32(const uint8_t * & p) { uint32_t v; memcpy(&v, p, 4); p += 4; return v; }
-static uint64_t ru64(const uint8_t * & p) { uint64_t v; memcpy(&v, p, 8); p += 8; return v; }
-static int32_t  ri32(const uint8_t * & p) { int32_t  v; memcpy(&v, p, 4); p += 4; return v; }
-
-static bool parse_cell_sizes(
-    const uint8_t * data, size_t data_size,
-    size_t & out_n_cells,
-    size_t & out_bytes_per_cell,
-    size_t & out_header_size)
-{
-    const uint8_t * p = data;
-    const uint8_t * end = data + data_size;
-
-    // skip io_magic + seq_id
-    p += 8;
-
-    if (p + 4 > end) return false;
-    uint32_t n_stream = ru32(p);
-    if (n_stream == 0) return false;
-    if (n_stream > 1) return false;
-
-    if (p + 4 > end) return false;
-    uint32_t cell_count = ru32(p);
-    if (cell_count == 0) return false;
-
-    // Skip per-cell metadata
-    for (uint32_t i = 0; i < cell_count; ++i) {
-        if (p + 8 > end) return false;
-        p += 4;
-        uint32_t n_seq_id = ru32(p);
-        p += n_seq_id * 4;
-    }
-
-    if (p + 8 > end) return false;
-    uint32_t v_trans = ru32(p);
-    uint32_t n_layer = ru32(p);
-    if (n_layer == 0) return false;
-
-    // Read per-layer sizes and compute bytes_per_cell
-    // Also record where the header ends (the data section starts here)
-    // The data section has: per-layer type info + per-layer key/value data
-    const uint8_t * meta_end = p; // right after v_trans + n_layer
-
-    std::vector<uint64_t> k_rows, v_rows;
-    for (uint32_t l = 0; l < n_layer; ++l) {
-        if (p + 12 > end) return false;
-        (void)ri32(p); // k_type_i
-        uint64_t kr = ru64(p); // k_size_row
-
-        if (!v_trans) {
-            if (p + 12 > end) return false;
-            (void)ri32(p); // v_type_i
-            uint64_t vr = ru64(p); // v_size_row
-            k_rows.push_back(kr);
-            v_rows.push_back(vr);
-        } else {
-            // transposed values: v_size_el + n_embd_v_gqa
-            if (p + 12 > end) return false;
-            (void)ri32(p); // v_type_i
-            uint32_t v_el = ru32(p);
-            uint32_t n_embd_v = ru32(p);
-            k_rows.push_back(kr);
-            v_rows.push_back((uint64_t)n_embd_v * v_el);
-        }
-    }
-
-    // header_size = everything up to (and including) per-layer type info
-    out_header_size = (size_t)(meta_end - data);
-    // cell data section starts at meta_end
-    const uint8_t * cell_data = meta_end;
-    size_t cell_data_size = data_size - (size_t)(cell_data - data);
-
-    // Verify cell data size is consistent with cell_count
-    size_t bpc = 0;
-    for (size_t l = 0; l < k_rows.size(); ++l) {
-        bpc += k_rows[l] + v_rows[l];
-    }
-    if (bpc == 0 || cell_data_size < cell_count * bpc) {
-        return false;
-    }
-
-    out_n_cells = cell_count;
-    out_bytes_per_cell = bpc;
-    return true;
-}
-
-// Parse an already-serialized KV blob and extract per-cell tensor data.
+// Cell-level KV blob parsing for storage dedup was attempted here (parse_cell_sizes,
+// llama_state_seq_parse_blob) and verified broken by review. The serialized format
+// is layer-major interleaved with data — external parsing duplicates fragile
+// internal knowledge. Cell-level dedup should be inside state_write_data.
 // Works on the captured blob directly — no re-serialization needed.
 size_t llama_state_seq_parse_blob(
     const uint8_t * blob,

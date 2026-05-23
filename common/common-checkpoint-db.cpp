@@ -86,72 +86,6 @@ void checkpoint_db::remove_cell(uint64_t hash) {
     std::error_code ec; fs::remove(cell_path(hash), ec);
 }
 
-// --- Reconstruct full KV blob from header + cell data ---
-
-std::vector<uint8_t> checkpoint_db::reconstruct_blob(
-    const std::vector<uint8_t> & header,
-    const std::vector<cell_ref> & cells,
-    const uint8_t * cell_data_buf)
-{
-    if (header.empty() || cells.empty()) return {};
-
-    // Parse header to get n_layer and per-layer sizes
-    const uint8_t * p = header.data();
-    const uint8_t * end = p + header.size();
-
-    if (p + 4 > end) return {};
-    uint32_t n_stream = 0; memcpy(&n_stream, p, 4); p += 4;
-    if (n_stream != 1) return {}; // only support n_stream=1
-
-    if (p + 4 > end) return {};
-    uint32_t cell_count = 0; memcpy(&cell_count, p, 4); p += 4;
-
-    // Skip per-cell metadata
-    for (uint32_t i = 0; i < cell_count && p + 8 <= end; ++i) {
-        p += 4; // pos
-        uint32_t ns = 0; memcpy(&ns, p, 4); p += 4;
-        p += ns * 4; // seq_ids
-    }
-
-    if (p + 8 > end) return {};
-    uint32_t v_trans = 0; memcpy(&v_trans, p, 4); p += 4;
-    uint32_t n_layer = 0; memcpy(&n_layer, p, 4); p += 4;
-
-    struct li { uint64_t kr; uint64_t vr; };
-    std::vector<li> layers;
-    for (uint32_t l = 0; l < n_layer && p + 12 <= end; ++l) {
-        p += 4; // k_type_i
-        uint64_t kr = 0; memcpy(&kr, p, 8); p += 8;
-        if (!v_trans) {
-            p += 4; // v_type_i
-            uint64_t vr = 0; memcpy(&vr, p, 8); p += 8;
-            layers.push_back({kr, vr});
-        } else {
-            p += 4; // v_type_i
-            uint32_t ve = 0; memcpy(&ve, p, 4); p += 4;
-            uint32_t nv = 0; memcpy(&nv, p, 4); p += 4;
-            layers.push_back({kr, (uint64_t)nv * ve});
-        }
-    }
-
-    // Build blob: header + layer-major cell data
-    std::vector<uint8_t> blob;
-    blob.insert(blob.end(), header.begin(), header.end());
-
-    const uint8_t * cd = cell_data_buf;
-    for (const auto & li : layers) {
-        for (size_t i = 0; i < cells.size(); ++i) {
-            blob.insert(blob.end(), cd, cd + li.kr);
-            cd += li.kr;
-        }
-        for (size_t i = 0; i < cells.size(); ++i) {
-            blob.insert(blob.end(), cd, cd + li.vr);
-            cd += li.vr;
-        }
-    }
-    return blob;
-}
-
 // --- constructor / destructor ---
 
 checkpoint_db::checkpoint_db(const checkpoint_db_config & cfg)
@@ -312,11 +246,8 @@ void checkpoint_db::store(
         write_entry_to_disk(e);
 
         // Content-addressed storage: hash the full blob for dedup.
-        // Cell-level parsing (per-cell splitting for shared prefixes) is
-        // available via llama_state_seq_parse_blob but the format has
-        // edge cases (null layer tensors, v_trans layout) that need
-        // proper debugging inside llama.cpp's state_write_data.
-        // For now, full-blob dedup catches identical entries.
+        // Cell-level dedup (shared prefixes) needs to be inside
+        // llama_kv_cache::state_write_data where the format is native.
         if (!kv_main.empty()) {
             cell_ref cr;
             cr.hash = hash_bytes(kv_main.data(), kv_main.size());
@@ -474,60 +405,25 @@ void checkpoint_db::write_entry_to_disk(entry * e) {
 void checkpoint_db::read_entry_from_disk(entry * e) const {
     if (!e || !e->on_disk) return;
 
-    // Try .kv file first (fast path)
     auto kpath = kv_path(e->id);
     std::ifstream is(kpath, std::ios::binary);
-    if (is.is_open()) {
-        auto kv_main_sz = r_u32(is);
-        e->kv_main.resize(kv_main_sz);
-        if (kv_main_sz > 0) is.read((char*)e->kv_main.data(), kv_main_sz);
-        auto kv_drft_sz = r_u32(is);
-        e->kv_drft.resize(kv_drft_sz);
-        if (kv_drft_sz > 0) is.read((char*)e->kv_drft.data(), kv_drft_sz);
-        e->checkpoints.clear(); // don't double-load from manifest
-        auto nck = r_u32(is);
-        for (uint32_t i = 0; i < nck; ++i) {
-            common_prompt_checkpoint ck;
-            ck.n_tokens = r_i64(is); ck.pos_min = r_i32(is); ck.pos_max = r_i32(is);
-            auto ts = r_u32(is); ck.data_tgt.resize(ts); if (ts > 0) is.read((char*)ck.data_tgt.data(), ts);
-            auto ds = r_u32(is); ck.data_dft.resize(ds); if (ds > 0) is.read((char*)ck.data_dft.data(), ds);
-            e->checkpoints.push_back(std::move(ck));
-        }
-        e->on_disk = false;
-        return;
+    if (!is.is_open()) return;
+
+    e->checkpoints.clear();
+    auto kv_main_sz = r_u32(is);
+    e->kv_main.resize(kv_main_sz);
+    if (kv_main_sz > 0) is.read((char*)e->kv_main.data(), kv_main_sz);
+    auto kv_drft_sz = r_u32(is);
+    e->kv_drft.resize(kv_drft_sz);
+    if (kv_drft_sz > 0) is.read((char*)e->kv_drft.data(), kv_drft_sz);
+    auto nck = r_u32(is);
+    for (uint32_t i = 0; i < nck; ++i) {
+        common_prompt_checkpoint ck;
+        ck.n_tokens = r_i64(is); ck.pos_min = r_i32(is); ck.pos_max = r_i32(is);
+        auto ts = r_u32(is); ck.data_tgt.resize(ts); if (ts > 0) is.read((char*)ck.data_tgt.data(), ts);
+        auto ds = r_u32(is); ck.data_dft.resize(ds); if (ds > 0) is.read((char*)ck.data_dft.data(), ds);
+        e->checkpoints.push_back(std::move(ck));
     }
-
-    // Fallback: reconstruct from cells
-    if (e->cells_main.empty() || e->kv_main_header.empty()) return;
-
-    size_t total = 0;
-    for (const auto & c : e->cells_main) total += c.size;
-    std::vector<uint8_t> cell_buf(total);
-    size_t pos = 0;
-    for (const auto & c : e->cells_main) {
-        if (!read_cell(c.hash, cell_buf.data() + pos, c.size)) {
-            LOG_ERR("checkpoint_db: missing cell %" PRIu64 "\n", c.hash);
-            e->kv_main.clear(); return;
-        }
-        pos += c.size;
-    }
-
-    e->kv_main = reconstruct_blob(e->kv_main_header, e->cells_main, cell_buf.data());
-    if (e->kv_main.empty()) return;
-
-    // Draft (same approach)
-    if (!e->cells_drft.empty() && !e->kv_drft_header.empty()) {
-        size_t dtotal = 0;
-        for (const auto & c : e->cells_drft) dtotal += c.size;
-        std::vector<uint8_t> dcell_buf(dtotal);
-        size_t dpos = 0;
-        for (const auto & c : e->cells_drft) {
-            if (!read_cell(c.hash, dcell_buf.data() + dpos, c.size)) { e->kv_drft.clear(); return; }
-            dpos += c.size;
-        }
-        e->kv_drft = reconstruct_blob(e->kv_drft_header, e->cells_drft, dcell_buf.data());
-    }
-
     e->on_disk = false;
 }
 

@@ -900,19 +900,13 @@ extern "C" {
                     llama_seq_id   dest_seq_id,
            llama_state_seq_flags   flags);
 
-    // Parse an already-serialized KV blob and extract cell information.
-    // Works on the blob directly — no re-serialization needed.
-    // Returns the number of cells found, or 0 if parsing fails.
-    // On success, out_header_size = bytes before cell data (magic + seq_id + metadata + layer info).
-    // Call twice: first with cells_out=NULL to get count and sizes,
-    // then with cells_out to fill per-cell data (each cell = k+v for all layers).
-    LLAMA_API size_t llama_state_seq_parse_blob(
-            const uint8_t * blob,
-                  size_t     blob_size,
-                  uint8_t * cells_out,
-                  size_t   * cell_sizes_out,
-                  size_t     max_cells,
-                  size_t   * out_header_size);
+    // NOTE: Cell-level KV serialization for storage dedup is intentionally
+    // not exposed here. The serialized blob format is layer-major interleaved
+    // with data (not "header then cells"), and depends on internal knowledge
+    // of v_trans, null layer tensors, and cell ranges. External parsing is
+    // fragile and has been attempted twice — both times producing incorrect
+    // results. Cell-level dedup should be implemented inside
+    // llama_kv_cache::state_write_data if desired.
 
     //
     // Decoding
