@@ -390,7 +390,7 @@ struct server_slot {
                 if (sz > 0) {
                     std::vector<uint8_t> kv(sz);
                     llama_state_seq_get_data_ext(ctx_tgt, kv.data(), sz, id, LLAMA_STATE_SEQ_FLAGS_NONE);
-                    ckpt_db->store(prompt.tokens.get_tokens(), kv, {}, prompt.checkpoints);
+                    ckpt_db->store(prompt.tokens.get_tokens(), kv, {}, prompt.checkpoints, ctx_tgt, id);
                     SLT_DBG(*this, "saved to checkpoint DB: %zu tokens, %.3f MiB\n",
                             prompt.tokens.size(), sz / (1024.0 * 1024.0));
                 }
@@ -781,7 +781,9 @@ private:
                     saved.tokens.get_tokens(),
                     saved.data.main,
                     saved.data.drft,
-                    saved.checkpoints);
+                    saved.checkpoints,
+                    slot.ctx_tgt,
+                    slot.id);
             }
         }
 
@@ -1211,6 +1213,7 @@ private:
         for (auto & slot : slots) {
             slot.ckpt_db = ckpt_db ? ckpt_db.get() : nullptr;
         }
+        SRV_DBG("checkpoint DB wired into %zu slots (ckpt_db=%p)\n", slots.size(), ckpt_db ? (void*)ckpt_db.get() : nullptr);
 
         if (!params_base.model_alias.empty()) {
             // backward compat: use first alias as model name
@@ -1453,7 +1456,9 @@ private:
                                 saved.tokens.get_tokens(),
                                 saved.data.main,
                                 saved.data.drft,
-                                saved.checkpoints);
+                                saved.checkpoints,
+                                ctx_tgt,
+                                ret->id);
                             SRV_INF("checkpoint DB: stored %zu tokens, %.3f MiB\n",
                                     saved.tokens.size(),
                                     saved.data.size() / (1024.0 * 1024.0));

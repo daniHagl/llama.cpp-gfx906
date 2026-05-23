@@ -7,61 +7,157 @@
 #include <cstring>
 #include <filesystem>
 #include <fstream>
-#include <tuple>
+#include <unordered_map>
 #include <vector>
 
 namespace fs = std::filesystem;
 
-// --- manifest binary format (version 2) ---
-// uint32_t magic        = 0xDBDBDBDB
-// uint32_t version      = 2
-// uint32_t model_id_len  // number of bytes in model_id string (0 = no model keying)
-// uint8_t[model_id_len] // model fingerprint string
-// uint32_t n_entries
-// for each entry:
+// --- manifest format v2 (current) and v3 (with cell refs) ---
+// v2: used for .kv file storage
+// v3: used for cell-based dedup storage
+// Both share magic + model_id + entry structure, v3 adds cell refs per entry.
+//
+// v3 entry format (difference from v2):
 //   uint32_t id
 //   uint64_t n_tokens
 //   llama_token[n_tokens]
-//   uint64_t kv_main_size
-//   uint64_t kv_drft_size
+//   uint64_t kv_main_header_size
+//   uint8_t[kv_main_header_size]       // header bytes (before cell data)
+//   uint32_t n_cells_main
+//   for each cell:
+//     uint64_t hash
+//     uint32_t size
+//   uint64_t kv_drft_header_size      // same for draft; 0 if no draft
+//   uint8_t[kv_drft_header_size]
+//   uint32_t n_cells_drft
+//   for each cell:
+//     uint64_t hash
+//     uint32_t size
 //   uint32_t n_checkpoints
 //   for each checkpoint:
-//     int64_t  ckpt_n_tokens
-//     int32_t  ckpt_pos_min
-//     int32_t  ckpt_pos_max
-//     uint64_t ckpt_tgt_size
-//     uint64_t ckpt_dft_size
-//   uint64_t disk_offset
-//   uint32_t disk_size
-//
-// version 1 manifests (no model_id) are discarded on load — unsafe to reuse
-// across different models.
+//     (same as v2)
+//   uint64_t reserved (0)
 
 static const uint32_t MANIFEST_MAGIC   = 0xDBDBDBDB;
-static const uint32_t MANIFEST_VERSION = 2;
+static const uint32_t MANIFEST_VERSION = 3;
 
 // helpers
-static void write_u32(std::ofstream & os, uint32_t v) { os.write(reinterpret_cast<const char*>(&v), sizeof(v)); }
-static void write_u64(std::ofstream & os, uint64_t v) { os.write(reinterpret_cast<const char*>(&v), sizeof(v)); }
-static void write_i64(std::ofstream & os, int64_t  v) { os.write(reinterpret_cast<const char*>(&v), sizeof(v)); }
-static void write_i32(std::ofstream & os, int32_t  v) { os.write(reinterpret_cast<const char*>(&v), sizeof(v)); }
+static void w_u32(std::ofstream & os, uint32_t v) { os.write((const char*)&v, sizeof(v)); }
+static void w_u64(std::ofstream & os, uint64_t v) { os.write((const char*)&v, sizeof(v)); }
+static void w_i64(std::ofstream & os, int64_t  v) { os.write((const char*)&v, sizeof(v)); }
+static void w_i32(std::ofstream & os, int32_t  v) { os.write((const char*)&v, sizeof(v)); }
 
-static uint32_t read_u32(std::ifstream & is) { uint32_t v; is.read(reinterpret_cast<char*>(&v), sizeof(v)); return v; }
-static uint64_t read_u64(std::ifstream & is) { uint64_t v; is.read(reinterpret_cast<char*>(&v), sizeof(v)); return v; }
-static int64_t  read_i64(std::ifstream & is) { int64_t  v; is.read(reinterpret_cast<char*>(&v), sizeof(v)); return v; }
-static int32_t  read_i32(std::ifstream & is) { int32_t  v; is.read(reinterpret_cast<char*>(&v), sizeof(v)); return v; }
+static uint32_t r_u32(std::ifstream & is) { uint32_t v; is.read((char*)&v, sizeof(v)); return v; }
+static uint64_t r_u64(std::ifstream & is) { uint64_t v; is.read((char*)&v, sizeof(v)); return v; }
+static int64_t  r_i64(std::ifstream & is) { int64_t  v; is.read((char*)&v, sizeof(v)); return v; }
+static int32_t  r_i32(std::ifstream & is) { int32_t  v; is.read((char*)&v, sizeof(v)); return v; }
+
+// --- FNV-1a hashing ---
+
+uint64_t checkpoint_db::hash_bytes(const uint8_t * data, size_t len) {
+    uint64_t h = 0xCBF29CE484222325ULL;
+    for (size_t i = 0; i < len; ++i) { h ^= data[i]; h *= 0x100000001B3ULL; }
+    return h;
+}
+
+std::string checkpoint_db::cell_path(uint64_t hash) const {
+    char buf[3] = {}; snprintf(buf, sizeof(buf), "%02x", (unsigned)(hash & 0xFF));
+    return cfg_.disk_path + "/d/" + buf + "/" + std::to_string(hash) + ".cell";
+}
+
+void checkpoint_db::write_cell(uint64_t hash, const uint8_t * data, size_t len) {
+    auto path = cell_path(hash);
+    if (fs::exists(path)) return; // content-addressed: already stored
+    fs::create_directories(fs::path(path).parent_path());
+    std::ofstream os(path, std::ios::binary);
+    if (!os.is_open()) { LOG_ERR("checkpoint_db: cannot write cell %s\n", path.c_str()); return; }
+    os.write((const char*)data, len);
+}
+
+bool checkpoint_db::read_cell(uint64_t hash, uint8_t * out, size_t len) const {
+    auto path = cell_path(hash);
+    std::ifstream is(path, std::ios::binary);
+    if (!is.is_open()) return false;
+    is.read((char*)out, len);
+    return !is.fail();
+}
+
+void checkpoint_db::remove_cell(uint64_t hash) {
+    std::error_code ec; fs::remove(cell_path(hash), ec);
+}
+
+// --- Reconstruct full KV blob from header + cell data ---
+
+std::vector<uint8_t> checkpoint_db::reconstruct_blob(
+    const std::vector<uint8_t> & header,
+    const std::vector<cell_ref> & cells,
+    const uint8_t * cell_data_buf)
+{
+    if (header.empty() || cells.empty()) return {};
+
+    // Parse header to get n_layer and per-layer sizes
+    const uint8_t * p = header.data();
+    const uint8_t * end = p + header.size();
+
+    if (p + 4 > end) return {};
+    uint32_t n_stream = 0; memcpy(&n_stream, p, 4); p += 4;
+    if (n_stream != 1) return {}; // only support n_stream=1
+
+    if (p + 4 > end) return {};
+    uint32_t cell_count = 0; memcpy(&cell_count, p, 4); p += 4;
+
+    // Skip per-cell metadata
+    for (uint32_t i = 0; i < cell_count && p + 8 <= end; ++i) {
+        p += 4; // pos
+        uint32_t ns = 0; memcpy(&ns, p, 4); p += 4;
+        p += ns * 4; // seq_ids
+    }
+
+    if (p + 8 > end) return {};
+    uint32_t v_trans = 0; memcpy(&v_trans, p, 4); p += 4;
+    uint32_t n_layer = 0; memcpy(&n_layer, p, 4); p += 4;
+
+    struct li { uint64_t kr; uint64_t vr; };
+    std::vector<li> layers;
+    for (uint32_t l = 0; l < n_layer && p + 12 <= end; ++l) {
+        p += 4; // k_type_i
+        uint64_t kr = 0; memcpy(&kr, p, 8); p += 8;
+        if (!v_trans) {
+            p += 4; // v_type_i
+            uint64_t vr = 0; memcpy(&vr, p, 8); p += 8;
+            layers.push_back({kr, vr});
+        } else {
+            p += 4; // v_type_i
+            uint32_t ve = 0; memcpy(&ve, p, 4); p += 4;
+            uint32_t nv = 0; memcpy(&nv, p, 4); p += 4;
+            layers.push_back({kr, (uint64_t)nv * ve});
+        }
+    }
+
+    // Build blob: header + layer-major cell data
+    std::vector<uint8_t> blob;
+    blob.insert(blob.end(), header.begin(), header.end());
+
+    const uint8_t * cd = cell_data_buf;
+    for (const auto & li : layers) {
+        for (size_t i = 0; i < cells.size(); ++i) {
+            blob.insert(blob.end(), cd, cd + li.kr);
+            cd += li.kr;
+        }
+        for (size_t i = 0; i < cells.size(); ++i) {
+            blob.insert(blob.end(), cd, cd + li.vr);
+            cd += li.vr;
+        }
+    }
+    return blob;
+}
+
+// --- constructor / destructor ---
 
 checkpoint_db::checkpoint_db(const checkpoint_db_config & cfg)
-    : cfg_(cfg)
-    , root_(std::make_unique<trie_node>())
-{
-}
+    : cfg_(cfg), root_(std::make_unique<trie_node>()) {}
 
-checkpoint_db::~checkpoint_db() {
-    try {
-        flush();
-    } catch (...) {}
-}
+checkpoint_db::~checkpoint_db() { try { flush(); } catch (...) {} }
 
 std::string checkpoint_db::manifest_path() const {
     return cfg_.disk_path + "/manifest.bin";
@@ -71,509 +167,428 @@ std::string checkpoint_db::kv_path(uint32_t id) const {
     return cfg_.disk_path + "/e/" + std::to_string(id) + ".kv";
 }
 
+// --- manifest load ---
+
 void checkpoint_db::load_manifest() {
-    if (cfg_.disk_path.empty()) {
-        return;
-    }
-
-    const auto mpath = manifest_path();
+    if (cfg_.disk_path.empty()) return;
+    auto mpath = manifest_path();
     std::ifstream is(mpath, std::ios::binary);
-    if (!is.is_open()) {
-        LOG_INF("checkpoint_db: no manifest at %s, starting fresh\n", mpath.c_str());
-        return;
-    }
+    if (!is.is_open()) { LOG_INF("checkpoint_db: no manifest at %s\n", mpath.c_str()); return; }
 
-    const auto magic = read_u32(is);
-    if (magic != MANIFEST_MAGIC) {
-        LOG_WRN("checkpoint_db: bad manifest magic, ignoring\n");
-        return;
-    }
+    auto magic = r_u32(is);
+    if (magic != MANIFEST_MAGIC) { LOG_WRN("checkpoint_db: bad magic\n"); return; }
+    auto ver = r_u32(is);
+    if (ver < 2 || ver > MANIFEST_VERSION) { LOG_WRN("checkpoint_db: unsupported v%u\n", ver); return; }
 
-    const auto version = read_u32(is);
-    if (version < 1 || version > MANIFEST_VERSION) {
-        LOG_WRN("checkpoint_db: unsupported manifest version %u, ignoring\n", version);
-        return;
-    }
+    auto mid_len = r_u32(is);
+    std::string mmid;
+    if (mid_len > 0) { mmid.resize(mid_len); is.read(&mmid[0], mid_len); }
+    if (!model_id_.empty() && mmid != model_id_) { LOG_WRN("checkpoint_db: model mismatch\n"); return; }
 
-    // version 2+: read model_id, skip entirely if mismatched
-    if (version >= 2) {
-        const auto mid_len = read_u32(is);
-        std::string manifest_mid;
-        if (mid_len > 0) {
-            manifest_mid.resize(mid_len);
-            is.read(&manifest_mid[0], mid_len);
+    auto n = r_u32(is);
+    LOG_INF("checkpoint_db: loading %u entries\n", n);
+
+    if (ver == 2) {
+        // v2: .kv file storage — skip entries to advance stream
+        for (uint32_t i = 0; i < n; ++i) {
+            r_u32(is); uint64_t nt = r_u64(is); is.seekg(nt * 4, std::ios::cur);
+            r_u64(is); r_u64(is); // kv_main_sz, kv_drft_sz
+            uint32_t nck = r_u32(is);
+            for (uint32_t j = 0; j < nck; ++j) { r_i64(is); r_i32(is); r_i32(is); r_u64(is); r_u64(is); }
+            r_u64(is); r_u32(is); // disk_offset, disk_size
         }
-        if (!model_id_.empty() && manifest_mid != model_id_) {
-            LOG_WRN("checkpoint_db: model mismatch, discarding all %u entries\n", read_u32(is));
-            return;
-        }
-    } else if (!model_id_.empty()) {
-        // version 1 has no model_id — discard if we have a model identity
-        LOG_WRN("checkpoint_db: discarding v1 manifest (no model_id, current model=%.32s)\n", model_id_.c_str());
+        LOG_WRN("checkpoint_db: discarding v2 entries (upgrade to v3)\n");
         return;
     }
 
-    const auto n = read_u32(is);
-    LOG_INF("checkpoint_db: loading %u entries from manifest\n", n);
-
+    // v3: cell-based storage
     for (uint32_t i = 0; i < n; ++i) {
         auto e = std::make_unique<entry>();
-        e->id          = read_u32(is);
-        const auto nt  = read_u64(is);
+        e->id = r_u32(is);
+        uint64_t nt = r_u64(is);
         e->tokens.resize(nt);
-        is.read(reinterpret_cast<char*>(e->tokens.data()), nt * sizeof(llama_token));
+        is.read((char*)e->tokens.data(), nt * 4);
 
-        const auto kv_main_sz = read_u64(is);
-        const auto kv_drft_sz = read_u64(is);
-        // leave kv_main/kv_drft empty — find() loads them from disk on demand
+        uint64_t hsz = r_u64(is);
+        e->kv_main_header.resize(hsz);
+        if (hsz > 0) is.read((char*)e->kv_main_header.data(), hsz);
 
-        const auto nck = read_u32(is);
-        for (uint32_t j = 0; j < nck; ++j) {
-            common_prompt_checkpoint ckpt;
-            ckpt.n_tokens = read_i64(is);
-            ckpt.pos_min  = read_i32(is);
-            ckpt.pos_max  = read_i32(is);
-            auto ckpt_tgt_sz = read_u64(is);
-            auto ckpt_dft_sz = read_u64(is);
-            ckpt.data_tgt.resize(ckpt_tgt_sz);
-            ckpt.data_dft.resize(ckpt_dft_sz);
-            e->checkpoints.push_back(std::move(ckpt));
+        uint32_t ncm = r_u32(is);
+        e->cells_main.resize(ncm);
+        for (uint32_t j = 0; j < ncm; ++j) {
+            e->cells_main[j].hash = r_u64(is);
+            e->cells_main[j].size = r_u32(is);
         }
 
-        e->disk_offset = read_u64(is);
-        e->disk_size   = read_u32(is);
-        e->on_disk     = true;
+        uint64_t dhsz = r_u64(is);
+        e->kv_drft_header.resize(dhsz);
+        if (dhsz > 0) is.read((char*)e->kv_drft_header.data(), dhsz);
+
+        uint32_t ncd = r_u32(is);
+        e->cells_drft.resize(ncd);
+        for (uint32_t j = 0; j < ncd; ++j) {
+            e->cells_drft[j].hash = r_u64(is);
+            e->cells_drft[j].size = r_u32(is);
+        }
+
+        uint32_t nck = r_u32(is);
+        for (uint32_t j = 0; j < nck; ++j) {
+            common_prompt_checkpoint ck;
+            ck.n_tokens = r_i64(is); ck.pos_min = r_i32(is); ck.pos_max = r_i32(is);
+            uint64_t ts = r_u64(is); ck.data_tgt.resize(ts); if (ts > 0) is.read((char*)ck.data_tgt.data(), ts);
+            uint64_t ds = r_u64(is); ck.data_dft.resize(ds); if (ds > 0) is.read((char*)ck.data_dft.data(), ds);
+            e->checkpoints.push_back(std::move(ck));
+        }
+        r_u64(is); // reserved
+
+        // disk size = all cell data bytes
+        e->disk_size = 0;
+        for (const auto & c : e->cells_main) e->disk_size += c.size;
+        for (const auto & c : e->cells_drft) e->disk_size += c.size;
+        e->on_disk = true;
         e->last_access = 0;
 
         total_disk_ += e->disk_size;
         entries_.push_back(std::move(e));
     }
 
-    // rebuild trie
-    for (auto & e : entries_) {
-        insert_into_trie(e.get());
-        lru_.push_back(e.get());
-    }
-
-    LOG_INF("checkpoint_db: loaded %zu entries (%.3f MiB on disk)\n",
-            entries_.size(), total_disk_ / (1024.0 * 1024.0));
+    for (auto & e : entries_) { insert_into_trie(e.get()); lru_.push_back(e.get()); }
+    LOG_INF("checkpoint_db: loaded %zu entries (%.3f MiB)\n", entries_.size(), total_disk_ / (1024.0*1024.0));
 }
 
-// --- storage ---
+// --- manifest write (v3) ---
+
+void checkpoint_db::write_manifest() {
+    auto mpath = manifest_path();
+    std::ofstream os(mpath, std::ios::binary);
+    if (!os.is_open()) { LOG_ERR("checkpoint_db: cannot write manifest\n"); return; }
+
+    w_u32(os, MANIFEST_MAGIC);
+    w_u32(os, MANIFEST_VERSION);
+    w_u32(os, (uint32_t)model_id_.size());
+    if (!model_id_.empty()) os.write(model_id_.data(), model_id_.size());
+    w_u32(os, (uint32_t)entries_.size());
+
+    for (const auto & e : entries_) {
+        w_u32(os, e->id);
+        w_u64(os, e->tokens.size());
+        os.write((const char*)e->tokens.data(), e->tokens.size() * 4);
+
+        w_u64(os, e->kv_main_header.size());
+        if (!e->kv_main_header.empty()) os.write((const char*)e->kv_main_header.data(), e->kv_main_header.size());
+        w_u32(os, (uint32_t)e->cells_main.size());
+        for (const auto & c : e->cells_main) { w_u64(os, c.hash); w_u32(os, c.size); }
+
+        w_u64(os, e->kv_drft_header.size());
+        if (!e->kv_drft_header.empty()) os.write((const char*)e->kv_drft_header.data(), e->kv_drft_header.size());
+        w_u32(os, (uint32_t)e->cells_drft.size());
+        for (const auto & c : e->cells_drft) { w_u64(os, c.hash); w_u32(os, c.size); }
+
+        w_u32(os, (uint32_t)e->checkpoints.size());
+        for (const auto & ck : e->checkpoints) {
+            w_i64(os, ck.n_tokens); w_i32(os, ck.pos_min); w_i32(os, ck.pos_max);
+            w_u64(os, ck.data_tgt.size()); if (!ck.data_tgt.empty()) os.write((const char*)ck.data_tgt.data(), ck.data_tgt.size());
+            w_u64(os, ck.data_dft.size()); if (!ck.data_dft.empty()) os.write((const char*)ck.data_dft.data(), ck.data_dft.size());
+        }
+        w_u64(os, 0); // reserved
+    }
+    LOG_INF("checkpoint_db: wrote manifest %zu entries\n", entries_.size());
+}
+
+// --- store / find ---
 
 void checkpoint_db::store(
     const llama_tokens & tokens,
     const std::vector<uint8_t> & kv_main,
     const std::vector<uint8_t> & kv_drft,
-    const std::list<common_prompt_checkpoint> & checkpoints)
+    const std::list<common_prompt_checkpoint> & checkpoints,
+    llama_context * ctx,
+    llama_seq_id seq_id)
 {
     evict();
-
     auto * e = create_entry(tokens, kv_main, kv_drft, checkpoints);
 
-    // always write to disk when disk path is configured (for crash recovery)
     if (!cfg_.disk_path.empty()) {
         write_entry_to_disk(e);
-        // free RAM if over capacity
+
+        // If context provided, also extract cells for dedup
+        if (ctx && !kv_main.empty() && kv_main.size() > 12) {
+            size_t n_cells = llama_state_seq_get_n_cells(ctx, seq_id);
+            if (n_cells > 1) {
+                std::vector<size_t> sizes(n_cells);
+                llama_state_seq_get_cells(ctx, seq_id, nullptr, sizes.data(), n_cells);
+
+                // Second call: get actual cell data
+                size_t cell_total = 0;
+                for (auto & s : sizes) cell_total += s;
+                std::vector<uint8_t> cell_data_buf(cell_total);
+                llama_state_seq_get_cells(ctx, seq_id, cell_data_buf.data(), sizes.data(), n_cells);
+
+                // Compute the header by parsing the original blob
+                // The simplest approach: call get_cells again with a dummy seq_id to compute sizes
+                // Actually we already have the blob in kv_main. Parse it to find header size.
+                const uint8_t * p = kv_main.data();
+                const uint8_t * end = p + kv_main.size();
+                if (p + 8 <= end) {
+                    p += 8; // magic + seq_id
+                    if (p + 4 <= end) { uint32_t ns_tmp; memcpy(&ns_tmp, p, 4); p += 4; (void)ns_tmp; }
+                    if (p + 4 <= end) { uint32_t cc_tmp; memcpy(&cc_tmp, p, 4); p += 4; (void)cc_tmp; }
+                    // Skip metadata
+                    for (size_t i = 0; i < n_cells && p + 8 <= end; ++i) {
+                        p += 4; uint32_t ns2; memcpy(&ns2, p, 4); p += 4; p += ns2 * 4;
+                    }
+                    size_t hdr_size = (size_t)(p - kv_main.data());
+                    e->kv_main_header.assign(kv_main.data(), kv_main.data() + hdr_size);
+
+                    // Store cells content-addressed
+                    size_t off = 0;
+                    for (size_t i = 0; i < n_cells; ++i) {
+                        cell_ref cr;
+                        cr.hash = hash_bytes(cell_data_buf.data() + off, sizes[i]);
+                        cr.size = (uint32_t)sizes[i];
+                        write_cell(cr.hash, cell_data_buf.data() + off, sizes[i]);
+                        e->cells_main.push_back(cr);
+                        off += sizes[i];
+                    }
+                    e->disk_size = (uint32_t)kv_main.size(); // keep .kv size for accounting
+                }
+            }
+        }
+
         if (cfg_.ram_capacity_mib > 0 && total_ram_ > cfg_.ram_capacity_mib * 1024ULL * 1024ULL) {
-            e->kv_main.clear();
-            e->kv_main.shrink_to_fit();
-            e->kv_drft.clear();
-            e->kv_drft.shrink_to_fit();
-            e->checkpoints.clear();
+            e->kv_main.clear(); e->kv_drft.clear(); e->checkpoints.clear();
         } else {
             total_ram_ += e->disk_size;
         }
     } else {
         total_ram_ += e->disk_size;
     }
-
-    if (!cfg_.disk_path.empty()) {
-        write_manifest();
-    }
+    if (!cfg_.disk_path.empty()) write_manifest();
 }
 
 checkpoint_db::match_result checkpoint_db::find(const llama_tokens & query) {
     match_result res;
-    if (!root_) {
-        return res;
-    }
+    if (!root_) return res;
 
     const entry * best = nullptr;
     size_t depth = 0;
     trie_node * node = root_.get();
-
     for (size_t i = 0; i < query.size(); ++i) {
         auto it = node->children.find(query[i]);
-        if (it == node->children.end()) {
-            break;
-        }
+        if (it == node->children.end()) break;
         node = it->second.get();
         depth = i + 1;
+        if (node->ent) { best = node->ent; res.n_matched = depth; }
+    }
+    if (!best) return res;
 
-        if (node->ent) {
-            best = node->ent;
-            res.n_matched = depth;
+    entry * e = const_cast<entry*>(best);
+    touch_lru(e);
+
+    if (e->on_disk && e->kv_main.empty()) {
+        read_entry_from_disk(e);
+        if (!e->kv_main.empty()) {
+            e->on_disk = false;
+            total_disk_ -= e->disk_size;
+            total_ram_  += e->disk_size;
         }
     }
 
-    if (!best) {
-        return res;
-    }
-
-    // load from disk if needed
-    entry * e = const_cast<entry*>(best);
-    touch_lru(e);
-    if (e->on_disk && e->kv_main.empty()) {
-        read_entry_from_disk(e);
-        e->on_disk = false;
-        total_disk_ -= e->disk_size;
-        total_ram_  += e->disk_size;
-    }
-
+    // Consider found if we have a match, even if KV data is empty
     res.found = true;
     res.matched_tokens = e->tokens;
-    res.kv_main       = e->kv_main;
-    res.kv_drft       = e->kv_drft;
-    res.checkpoints   = e->checkpoints;
-
+    res.kv_main = e->kv_main;
+    res.kv_drft = e->kv_drft;
+    res.checkpoints = e->checkpoints;
     return res;
 }
 
+// --- eviction ---
+
 void checkpoint_db::evict() {
     if (cfg_.disk_path.empty()) {
-        // RAM-only mode: evict LRU when over ram_capacity
-        while (total_ram_ > cfg_.ram_capacity_mib * 1024ULL * 1024ULL && !lru_.empty()) {
-            evict_one();
-        }
+        while (total_ram_ > cfg_.ram_capacity_mib * 1024ULL * 1024ULL && !lru_.empty()) evict_one();
         return;
     }
-
-    // disk mode: first ensure all entries are on disk
-    // then evict oldest from RAM when over capacity
-    for (auto & e : entries_) {
-        if (!e->on_disk && !e->kv_main.empty()) {
-            write_entry_to_disk(e.get());
-        }
-    }
-
-    // also bound disk usage
-    while (total_disk_ > cfg_.disk_capacity_mib * 1024ULL * 1024ULL && !lru_.empty()) {
-        remove_entry_from_disk(lru_.back());
-    }
-
-    if (!cfg_.disk_path.empty()) {
-        write_manifest();
-    }
+    for (auto & e : entries_) if (!e->on_disk && !e->kv_main.empty()) write_entry_to_disk(e.get());
+    while (total_disk_ > cfg_.disk_capacity_mib * 1024ULL * 1024ULL && !lru_.empty()) remove_entry_from_disk(lru_.back());
+    if (!cfg_.disk_path.empty()) write_manifest();
 }
 
 void checkpoint_db::flush() {
-    if (cfg_.disk_path.empty()) {
-        return;
-    }
-
+    if (cfg_.disk_path.empty()) return;
     fs::create_directories(cfg_.disk_path + "/e");
-
-    LOG_INF("checkpoint_db: flushing %zu entries to disk\n", entries_.size());
-
-    for (auto & e : entries_) {
-        write_entry_to_disk(e.get());
-    }
-
+    LOG_INF("checkpoint_db: flushing %zu entries\n", entries_.size());
+    for (auto & e : entries_) write_entry_to_disk(e.get());
     write_manifest();
 }
 
-void checkpoint_db::write_manifest() {
-    const auto mpath = manifest_path();
-    std::ofstream os(mpath, std::ios::binary);
-    if (!os.is_open()) {
-        LOG_ERR("checkpoint_db: cannot write manifest to %s\n", mpath.c_str());
-        return;
-    }
+// --- entry helpers ---
 
-    write_u32(os, MANIFEST_MAGIC);
-    write_u32(os, MANIFEST_VERSION);
-    // version 2: write model_id for cross-model safety
-    write_u32(os, static_cast<uint32_t>(model_id_.size()));
-    if (!model_id_.empty()) {
-        os.write(model_id_.data(), model_id_.size());
-    }
-    write_u32(os, static_cast<uint32_t>(entries_.size()));
-
-    for (const auto & e : entries_) {
-        write_u32(os, e->id);
-        write_u64(os, e->tokens.size());
-        os.write(reinterpret_cast<const char*>(e->tokens.data()), e->tokens.size() * sizeof(llama_token));
-
-        write_u64(os, e->kv_main.size());
-        write_u64(os, e->kv_drft.size());
-
-        write_u32(os, static_cast<uint32_t>(e->checkpoints.size()));
-        for (const auto & ckpt : e->checkpoints) {
-            write_i64(os, ckpt.n_tokens);
-            write_i32(os, ckpt.pos_min);
-            write_i32(os, ckpt.pos_max);
-            write_u64(os, ckpt.data_tgt.size());
-            write_u64(os, ckpt.data_dft.size());
-        }
-
-        write_u64(os, e->disk_offset);
-        write_u32(os, e->disk_size);
-    }
-
-    LOG_INF("checkpoint_db: wrote manifest with %zu entries\n", entries_.size());
-}
-
-void checkpoint_db::read_manifest() {
-    // alias for load_manifest
-    load_manifest();
-}
-
-// --- private helpers ---
-
-checkpoint_db::entry * checkpoint_db::create_entry(
-    const llama_tokens & tokens,
-    const std::vector<uint8_t> & kv_main,
-    const std::vector<uint8_t> & kv_drft,
+checkpoint_db::entry * checkpoint_db::create_entry(const llama_tokens & tokens,
+    const std::vector<uint8_t> & kv_main, const std::vector<uint8_t> & kv_drft,
     const std::list<common_prompt_checkpoint> & checkpoints)
 {
     auto e = std::make_unique<entry>();
-    e->id     = next_id_++;
-    e->tokens = tokens;
-    e->kv_main = kv_main;
-    e->kv_drft = kv_drft;
-    e->checkpoints = checkpoints;
-    e->on_disk     = false;
-    e->disk_offset = 0;
-    e->disk_size   = 0;
+    e->id = next_id_++;
+    e->tokens = tokens; e->kv_main = kv_main; e->kv_drft = kv_drft; e->checkpoints = checkpoints;
+    e->disk_size = (uint32_t)(kv_main.size() + kv_drft.size());
     e->last_access = ggml_time_us();
-
-    // estimate disk size
-    e->disk_size = static_cast<uint32_t>(kv_main.size() + kv_drft.size());
-    for (const auto & ckpt : checkpoints) {
-        e->disk_size += static_cast<uint32_t>(ckpt.data_tgt.size() + ckpt.data_dft.size());
-    }
-
     entry * ptr = e.get();
     entries_.push_back(std::move(e));
     insert_into_trie(ptr);
     lru_.push_back(ptr);
     touch_lru(ptr);
-
     return ptr;
 }
 
 void checkpoint_db::insert_into_trie(entry * e) {
     trie_node * node = root_.get();
     for (size_t i = 0; i < e->tokens.size(); ++i) {
-        const auto tok = e->tokens[i];
-        if (!node->children[tok]) {
-            node->children[tok] = std::make_unique<trie_node>();
-        }
+        auto tok = e->tokens[i];
+        if (!node->children[tok]) node->children[tok] = std::make_unique<trie_node>();
         node = node->children[tok].get();
-        // set entry at every prefix node so shorter queries find matches too
         node->ent = e;
     }
 }
 
 void checkpoint_db::touch_lru(entry * e) {
     e->last_access = ggml_time_us();
-
-    // bubble to front in lru list
     auto it = std::find(lru_.begin(), lru_.end(), e);
-    if (it != lru_.end() && it != lru_.begin()) {
-        lru_.splice(lru_.begin(), lru_, it);
-    }
+    if (it != lru_.end() && it != lru_.begin()) lru_.splice(lru_.begin(), lru_, it);
 }
 
 void checkpoint_db::evict_one() {
-    if (lru_.empty()) {
-        return;
-    }
-
+    if (lru_.empty()) return;
     entry * e = lru_.back();
-
-    // free RAM
     total_ram_ -= e->disk_size;
-
-    if (!cfg_.disk_path.empty()) {
-        write_entry_to_disk(e);
-    }
-
-    e->kv_main.clear();
-    e->kv_main.shrink_to_fit();
-    e->kv_drft.clear();
-    e->kv_drft.shrink_to_fit();
-    e->checkpoints.clear();
+    if (!cfg_.disk_path.empty()) write_entry_to_disk(e);
+    e->kv_main.clear(); e->kv_drft.clear(); e->checkpoints.clear();
     e->on_disk = true;
-
     lru_.pop_back();
     lru_.push_front(e);
 }
 
-void checkpoint_db::write_entry_to_disk(entry * e) {
-    if (cfg_.disk_path.empty() || !e) {
-        return;
-    }
+// --- disk I/O: .kv files (legacy) + cell storage ---
 
+void checkpoint_db::write_entry_to_disk(entry * e) {
+    if (cfg_.disk_path.empty() || !e) return;
     fs::create_directories(cfg_.disk_path + "/e");
 
     const auto kpath = kv_path(e->id);
     std::ofstream os(kpath, std::ios::binary);
-    if (!os.is_open()) {
-        LOG_ERR("checkpoint_db: cannot write %s\n", kpath.c_str());
-        return;
+    if (!os.is_open()) { LOG_ERR("checkpoint_db: cannot write %s\n", kpath.c_str()); return; }
+
+    w_u32(os, (uint32_t)e->kv_main.size());
+    if (!e->kv_main.empty()) os.write((const char*)e->kv_main.data(), e->kv_main.size());
+    w_u32(os, (uint32_t)e->kv_drft.size());
+    if (!e->kv_drft.empty()) os.write((const char*)e->kv_drft.data(), e->kv_drft.size());
+    w_u32(os, (uint32_t)e->checkpoints.size());
+    for (const auto & ck : e->checkpoints) {
+        w_i64(os, ck.n_tokens); w_i32(os, ck.pos_min); w_i32(os, ck.pos_max);
+        w_u32(os, (uint32_t)ck.data_tgt.size()); if (!ck.data_tgt.empty()) os.write((const char*)ck.data_tgt.data(), ck.data_tgt.size());
+        w_u32(os, (uint32_t)ck.data_dft.size()); if (!ck.data_dft.empty()) os.write((const char*)ck.data_dft.data(), ck.data_dft.size());
     }
 
-    // format:
-    //   uint32_t kv_main_size
-    //   uint8_t[kv_main_size]
-    //   uint32_t kv_drft_size
-    //   uint8_t[kv_drft_size]
-    //   uint32_t n_checkpoints
-    //   for each:
-    //     int64_t  n_tokens
-    //     int32_t  pos_min
-    //     int32_t  pos_max
-    //     uint32_t data_tgt_size
-    //     uint8_t[data_tgt_size]
-    //     uint32_t data_dft_size
-    //     uint8_t[data_dft_size]
-
-    const auto kv_main_sz = static_cast<uint32_t>(e->kv_main.size());
-    const auto kv_drft_sz = static_cast<uint32_t>(e->kv_drft.size());
-
-    write_u32(os, kv_main_sz);
-    if (kv_main_sz > 0) {
-        os.write(reinterpret_cast<const char*>(e->kv_main.data()), kv_main_sz);
-    }
-
-    write_u32(os, kv_drft_sz);
-    if (kv_drft_sz > 0) {
-        os.write(reinterpret_cast<const char*>(e->kv_drft.data()), kv_drft_sz);
-    }
-
-    write_u32(os, static_cast<uint32_t>(e->checkpoints.size()));
-    for (const auto & ckpt : e->checkpoints) {
-        write_i64(os, ckpt.n_tokens);
-        write_i32(os, ckpt.pos_min);
-        write_i32(os, ckpt.pos_max);
-
-        const auto tgt_sz = static_cast<uint32_t>(ckpt.data_tgt.size());
-        write_u32(os, tgt_sz);
-        if (tgt_sz > 0) {
-            os.write(reinterpret_cast<const char*>(ckpt.data_tgt.data()), tgt_sz);
-        }
-
-        const auto dft_sz = static_cast<uint32_t>(ckpt.data_dft.size());
-        write_u32(os, dft_sz);
-        if (dft_sz > 0) {
-            os.write(reinterpret_cast<const char*>(ckpt.data_dft.data()), dft_sz);
-        }
-    }
-
-    const auto file_size = static_cast<uint32_t>(os.tellp());
-    if (e->on_disk) {
-        // update disk size (may have changed)
-        total_disk_ -= e->disk_size;
-    }
+    auto file_size = (uint32_t)os.tellp();
+    if (e->on_disk) total_disk_ -= e->disk_size;
     total_disk_ += file_size;
-
-    e->disk_offset = 0;
-    e->disk_size   = file_size;
-    e->on_disk     = true;
-
-    LOG_DBG("checkpoint_db: wrote entry %u to %s (%u bytes)\n", e->id, kpath.c_str(), file_size);
+    e->disk_size = file_size;
+    e->on_disk = true;
 }
 
 void checkpoint_db::read_entry_from_disk(entry * e) const {
-    if (!e || !e->on_disk) {
-        return;
-    }
+    if (!e || !e->on_disk) return;
 
-    const auto kpath = kv_path(e->id);
+    // Try .kv file first (fast path)
+    auto kpath = kv_path(e->id);
     std::ifstream is(kpath, std::ios::binary);
-    if (!is.is_open()) {
-        LOG_ERR("checkpoint_db: cannot read %s\n", kpath.c_str());
+    if (is.is_open()) {
+        auto kv_main_sz = r_u32(is);
+        e->kv_main.resize(kv_main_sz);
+        if (kv_main_sz > 0) is.read((char*)e->kv_main.data(), kv_main_sz);
+        auto kv_drft_sz = r_u32(is);
+        e->kv_drft.resize(kv_drft_sz);
+        if (kv_drft_sz > 0) is.read((char*)e->kv_drft.data(), kv_drft_sz);
+        e->checkpoints.clear(); // don't double-load from manifest
+        auto nck = r_u32(is);
+        for (uint32_t i = 0; i < nck; ++i) {
+            common_prompt_checkpoint ck;
+            ck.n_tokens = r_i64(is); ck.pos_min = r_i32(is); ck.pos_max = r_i32(is);
+            auto ts = r_u32(is); ck.data_tgt.resize(ts); if (ts > 0) is.read((char*)ck.data_tgt.data(), ts);
+            auto ds = r_u32(is); ck.data_dft.resize(ds); if (ds > 0) is.read((char*)ck.data_dft.data(), ds);
+            e->checkpoints.push_back(std::move(ck));
+        }
+        e->on_disk = false;
         return;
     }
 
-    const auto kv_main_sz = read_u32(is);
-    e->kv_main.resize(kv_main_sz);
-    if (kv_main_sz > 0) {
-        is.read(reinterpret_cast<char*>(e->kv_main.data()), kv_main_sz);
+    // Fallback: reconstruct from cells
+    if (e->cells_main.empty() || e->kv_main_header.empty()) return;
+
+    size_t total = 0;
+    for (const auto & c : e->cells_main) total += c.size;
+    std::vector<uint8_t> cell_buf(total);
+    size_t pos = 0;
+    for (const auto & c : e->cells_main) {
+        if (!read_cell(c.hash, cell_buf.data() + pos, c.size)) {
+            LOG_ERR("checkpoint_db: missing cell %" PRIu64 "\n", c.hash);
+            e->kv_main.clear(); return;
+        }
+        pos += c.size;
     }
 
-    const auto kv_drft_sz = read_u32(is);
-    e->kv_drft.resize(kv_drft_sz);
-    if (kv_drft_sz > 0) {
-        is.read(reinterpret_cast<char*>(e->kv_drft.data()), kv_drft_sz);
-    }
+    e->kv_main = reconstruct_blob(e->kv_main_header, e->cells_main, cell_buf.data());
+    if (e->kv_main.empty()) return;
 
-    const auto nck = read_u32(is);
-    e->checkpoints.clear();
-    for (uint32_t i = 0; i < nck; ++i) {
-        common_prompt_checkpoint ckpt;
-        ckpt.n_tokens = read_i64(is);
-        ckpt.pos_min  = read_i32(is);
-        ckpt.pos_max  = read_i32(is);
-
-        auto tgt_sz = read_u32(is);
-        ckpt.data_tgt.resize(tgt_sz);
-        if (tgt_sz > 0) {
-            is.read(reinterpret_cast<char*>(ckpt.data_tgt.data()), tgt_sz);
+    // Draft (same approach)
+    if (!e->cells_drft.empty() && !e->kv_drft_header.empty()) {
+        size_t dtotal = 0;
+        for (const auto & c : e->cells_drft) dtotal += c.size;
+        std::vector<uint8_t> dcell_buf(dtotal);
+        size_t dpos = 0;
+        for (const auto & c : e->cells_drft) {
+            if (!read_cell(c.hash, dcell_buf.data() + dpos, c.size)) { e->kv_drft.clear(); return; }
+            dpos += c.size;
         }
-
-        auto dft_sz = read_u32(is);
-        ckpt.data_dft.resize(dft_sz);
-        if (dft_sz > 0) {
-            is.read(reinterpret_cast<char*>(ckpt.data_dft.data()), dft_sz);
-        }
-
-        e->checkpoints.push_back(std::move(ckpt));
+        e->kv_drft = reconstruct_blob(e->kv_drft_header, e->cells_drft, dcell_buf.data());
     }
 
     e->on_disk = false;
-
-    LOG_DBG("checkpoint_db: read entry %u from %s\n", e->id, kpath.c_str());
 }
 
 void checkpoint_db::remove_entry_from_disk(entry * e) {
-    // remove from LRU and trie
-    // first, remove trie linkage
+    // Remove trie linkage
     if (root_) {
         trie_node * node = root_.get();
         for (size_t i = 0; i < e->tokens.size(); ++i) {
             auto it = node->children.find(e->tokens[i]);
-            if (it == node->children.end()) {
-                break;
-            }
+            if (it == node->children.end()) break;
             node = it->second.get();
         }
-        if (node->ent == e) {
-            node->ent = nullptr;
-        }
+        if (node->ent == e) node->ent = nullptr;
     }
 
-    // remove disk file
+    // Remove .kv file
     if (e->on_disk) {
-        const auto kpath = kv_path(e->id);
-        std::error_code ec;
-        fs::remove(kpath, ec);
+        std::error_code ec; fs::remove(kv_path(e->id), ec);
         total_disk_ -= e->disk_size;
     }
 
-    // remove from LRU
-    auto it = std::find(lru_.begin(), lru_.end(), e);
-    if (it != lru_.end()) {
-        lru_.erase(it);
+    // Remove orphaned cells (reference-counted)
+    std::unordered_map<uint64_t, uint32_t> refcount;
+    for (const auto & other : entries_) {
+        if (other.get() == e) continue;
+        for (const auto & c : other->cells_main) refcount[c.hash]++;
+        for (const auto & c : other->cells_drft) refcount[c.hash]++;
     }
+    for (const auto & c : e->cells_main) if (refcount[c.hash] == 0) remove_cell(c.hash);
+    for (const auto & c : e->cells_drft) if (refcount[c.hash] == 0) remove_cell(c.hash);
 
-    // remove from entries vector
+    auto it = std::find(lru_.begin(), lru_.end(), e);
+    if (it != lru_.end()) lru_.erase(it);
+
     auto eit = std::find_if(entries_.begin(), entries_.end(),
         [e](const auto & p) { return p.get() == e; });
-    if (eit != entries_.end()) {
-        total_ram_ -= e->disk_size;
-        entries_.erase(eit);
-    }
+    if (eit != entries_.end()) { total_ram_ -= e->disk_size; entries_.erase(eit); }
 }
