@@ -3929,23 +3929,25 @@ static bool parse_cell_sizes(
     const uint8_t * p = data;
     const uint8_t * end = data + data_size;
 
-    if (data_size < 8) return false;
+    if (data_size < 8) { LLAMA_LOG_ERROR("parse_cell_sizes: data too small (%zu)\n", data_size); return false; }
 
     // skip io_magic + seq_id
     p += 8;
 
-    if (p + 4 > end) return false;
+    if (p + 4 > end) { LLAMA_LOG_ERROR("parse_cell_sizes: no n_stream\n"); return false; }
     uint32_t n_stream = ru32(p);
-    if (n_stream == 0) return false;
+    if (n_stream == 0) { LLAMA_LOG_ERROR("parse_cell_sizes: n_stream=0\n"); return false; }
+    if (n_stream > 1) { LLAMA_LOG_ERROR("parse_cell_sizes: n_stream=%u unsupported\n", n_stream); return false; }
 
     // We support n_stream=1 for now (the common case)
     // Multi-stream KV caches are rare
-    if (p + 4 > end) return false;
+    if (p + 4 > end) { LLAMA_LOG_ERROR("parse_cell_sizes: no cell_count\n"); return false; }
     uint32_t cell_count = ru32(p);
+    if (cell_count == 0) { LLAMA_LOG_ERROR("parse_cell_sizes: cell_count=0\n"); return false; }
 
     // Skip per-cell metadata
     for (uint32_t i = 0; i < cell_count; ++i) {
-        if (p + 8 > end) return false;
+        if (p + 8 > end) { LLAMA_LOG_ERROR("parse_cell_sizes: metadata oob cell %u\n", i); return false; }
         p += 4; // pos
         uint32_t n_seq_id = ru32(p);
         // Note: we can't detect M-RoPE ext here because we don't have hparams
@@ -3955,9 +3957,10 @@ static bool parse_cell_sizes(
         p += n_seq_id * 4; // seq_ids
     }
 
-    if (p + 8 > end) return false;
+    if (p + 8 > end) { LLAMA_LOG_ERROR("parse_cell_sizes: no v_trans/n_layer\n"); return false; }
     uint32_t v_trans = ru32(p);
     uint32_t n_layer = ru32(p);
+    if (n_layer == 0) { LLAMA_LOG_ERROR("parse_cell_sizes: n_layer=0\n"); return false; }
 
     // Read per-layer sizes and compute bytes_per_cell
     // Also record where the header ends (the data section starts here)

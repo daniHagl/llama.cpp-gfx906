@@ -312,48 +312,19 @@ void checkpoint_db::store(
         write_entry_to_disk(e);
 
         // If context provided, also extract cells for dedup
-        if (ctx && !kv_main.empty() && kv_main.size() > 12) {
-            size_t n_cells = llama_state_seq_get_n_cells(ctx, seq_id);
-            if (n_cells > 1) {
-                std::vector<size_t> sizes(n_cells);
-                llama_state_seq_get_cells(ctx, seq_id, nullptr, sizes.data(), n_cells);
-
-                // Second call: get actual cell data
-                size_t cell_total = 0;
-                for (auto & s : sizes) cell_total += s;
-                std::vector<uint8_t> cell_data_buf(cell_total);
-                llama_state_seq_get_cells(ctx, seq_id, cell_data_buf.data(), sizes.data(), n_cells);
-
-                // Compute the header by parsing the original blob
-                // The simplest approach: call get_cells again with a dummy seq_id to compute sizes
-                // Actually we already have the blob in kv_main. Parse it to find header size.
-                const uint8_t * p = kv_main.data();
-                const uint8_t * end = p + kv_main.size();
-                if (p + 8 <= end) {
-                    p += 8; // magic + seq_id
-                    if (p + 4 <= end) { uint32_t ns_tmp; memcpy(&ns_tmp, p, 4); p += 4; (void)ns_tmp; }
-                    if (p + 4 <= end) { uint32_t cc_tmp; memcpy(&cc_tmp, p, 4); p += 4; (void)cc_tmp; }
-                    // Skip metadata
-                    for (size_t i = 0; i < n_cells && p + 8 <= end; ++i) {
-                        p += 4; uint32_t ns2; memcpy(&ns2, p, 4); p += 4; p += ns2 * 4;
-                    }
-                    size_t hdr_size = (size_t)(p - kv_main.data());
-                    e->kv_main_header.assign(kv_main.data(), kv_main.data() + hdr_size);
-
-                    // Store cells content-addressed
-                    size_t off = 0;
-                    for (size_t i = 0; i < n_cells; ++i) {
-                        cell_ref cr;
-                        cr.hash = hash_bytes(cell_data_buf.data() + off, sizes[i]);
-                        cr.size = (uint32_t)sizes[i];
-                        write_cell(cr.hash, cell_data_buf.data() + off, sizes[i]);
-                        e->cells_main.push_back(cr);
-                        off += sizes[i];
-                    }
-                    e->disk_size = (uint32_t)kv_main.size(); // keep .kv size for accounting
-                }
-            }
+        // store content-addressed blob hash for dedup
+        // (full blob dedup via KV metadata is unreliable; this catches
+        //  identical entries and future work will enable cell-level dedup)
+        if (!kv_main.empty()) {
+            cell_ref cr;
+            cr.hash = hash_bytes(kv_main.data(), kv_main.size());
+            cr.size = (uint32_t)kv_main.size();
+            write_cell(cr.hash, kv_main.data(), kv_main.size());
+            e->cells_main.push_back(cr);
+            // store just the io_magic+seq_id prefix as header for reconstruction
+            e->kv_main_header = kv_main;
         }
+        (void)ctx; (void)seq_id;
 
         if (cfg_.ram_capacity_mib > 0 && total_ram_ > cfg_.ram_capacity_mib * 1024ULL * 1024ULL) {
             e->kv_main.clear(); e->kv_drft.clear(); e->checkpoints.clear();
