@@ -900,29 +900,19 @@ extern "C" {
                     llama_seq_id   dest_seq_id,
            llama_state_seq_flags   flags);
 
-    // Cell-major serialization for storage dedup.
-    // Returns the number of KV cells for the given sequence.
-    LLAMA_API size_t llama_state_seq_get_n_cells(
-            struct llama_context * ctx,
-                    llama_seq_id   seq_id);
-
-    // Extract all cells into separate buffers. dst_sizes must be at least max_cells entries.
-    // Each cell is a contiguous chunk of K+V tensor data for all layers.
-    // Returns the number of cells written. Call with *n_cells_out=0 first to get sizes.
-    LLAMA_API size_t llama_state_seq_get_cells(
-            struct llama_context * ctx,
-                    llama_seq_id   seq_id,
-                          uint8_t * dst,
-                          size_t  * dst_sizes,
-                          size_t    max_cells);
-
-    // Reconstruct the full KV state from cell data.
-    LLAMA_API size_t llama_state_seq_set_cells(
-            struct llama_context * ctx,
-                    llama_seq_id   dest_seq_id,
-                          size_t   n_cells,
-                    const size_t * cell_sizes,
-                    const uint8_t * cell_data);
+    // Parse an already-serialized KV blob and extract cell information.
+    // Works on the blob directly — no re-serialization needed.
+    // Returns the number of cells found, or 0 if parsing fails.
+    // On success, out_header_size = bytes before cell data (magic + seq_id + metadata + layer info).
+    // Call twice: first with cells_out=NULL to get count and sizes,
+    // then with cells_out to fill per-cell data (each cell = k+v for all layers).
+    LLAMA_API size_t llama_state_seq_parse_blob(
+            const uint8_t * blob,
+                  size_t     blob_size,
+                  uint8_t * cells_out,
+                  size_t   * cell_sizes_out,
+                  size_t     max_cells,
+                  size_t   * out_header_size);
 
     //
     // Decoding

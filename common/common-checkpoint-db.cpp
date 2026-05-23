@@ -311,19 +311,21 @@ void checkpoint_db::store(
     if (!cfg_.disk_path.empty()) {
         write_entry_to_disk(e);
 
-        // If context provided, also extract cells for dedup
-        // store content-addressed blob hash for dedup
-        // (full blob dedup via KV metadata is unreliable; this catches
-        //  identical entries and future work will enable cell-level dedup)
+        // Content-addressed storage: hash the full blob for dedup.
+        // Cell-level parsing (per-cell splitting for shared prefixes) is
+        // available via llama_state_seq_parse_blob but the format has
+        // edge cases (null layer tensors, v_trans layout) that need
+        // proper debugging inside llama.cpp's state_write_data.
+        // For now, full-blob dedup catches identical entries.
         if (!kv_main.empty()) {
             cell_ref cr;
             cr.hash = hash_bytes(kv_main.data(), kv_main.size());
             cr.size = (uint32_t)kv_main.size();
             write_cell(cr.hash, kv_main.data(), kv_main.size());
             e->cells_main.push_back(cr);
-            // store just the io_magic+seq_id prefix as header for reconstruction
             e->kv_main_header = kv_main;
         }
+
         (void)ctx; (void)seq_id;
 
         if (cfg_.ram_capacity_mib > 0 && total_ram_ > cfg_.ram_capacity_mib * 1024ULL * 1024ULL) {
@@ -334,6 +336,7 @@ void checkpoint_db::store(
     } else {
         total_ram_ += e->disk_size;
     }
+    (void)ctx; (void)seq_id;
     if (!cfg_.disk_path.empty()) write_manifest();
 }
 

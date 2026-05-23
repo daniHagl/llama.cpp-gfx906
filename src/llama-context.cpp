@@ -3929,38 +3929,30 @@ static bool parse_cell_sizes(
     const uint8_t * p = data;
     const uint8_t * end = data + data_size;
 
-    if (data_size < 8) { LLAMA_LOG_ERROR("parse_cell_sizes: data too small (%zu)\n", data_size); return false; }
-
     // skip io_magic + seq_id
     p += 8;
 
-    if (p + 4 > end) { LLAMA_LOG_ERROR("parse_cell_sizes: no n_stream\n"); return false; }
+    if (p + 4 > end) return false;
     uint32_t n_stream = ru32(p);
-    if (n_stream == 0) { LLAMA_LOG_ERROR("parse_cell_sizes: n_stream=0\n"); return false; }
-    if (n_stream > 1) { LLAMA_LOG_ERROR("parse_cell_sizes: n_stream=%u unsupported\n", n_stream); return false; }
+    if (n_stream == 0) return false;
+    if (n_stream > 1) return false;
 
-    // We support n_stream=1 for now (the common case)
-    // Multi-stream KV caches are rare
-    if (p + 4 > end) { LLAMA_LOG_ERROR("parse_cell_sizes: no cell_count\n"); return false; }
+    if (p + 4 > end) return false;
     uint32_t cell_count = ru32(p);
-    if (cell_count == 0) { LLAMA_LOG_ERROR("parse_cell_sizes: cell_count=0\n"); return false; }
+    if (cell_count == 0) return false;
 
     // Skip per-cell metadata
     for (uint32_t i = 0; i < cell_count; ++i) {
-        if (p + 8 > end) { LLAMA_LOG_ERROR("parse_cell_sizes: metadata oob cell %u\n", i); return false; }
-        p += 4; // pos
+        if (p + 8 > end) return false;
+        p += 4;
         uint32_t n_seq_id = ru32(p);
-        // Note: we can't detect M-RoPE ext here because we don't have hparams
-        // We assume ext is absent (n_pos_per_embd == 1), which covers most models
-        // For M-RoPE models, cell_ext is serialized into the metadata bytes
-        // and parsing will be off by 8*cell_count bytes.
-        p += n_seq_id * 4; // seq_ids
+        p += n_seq_id * 4;
     }
 
-    if (p + 8 > end) { LLAMA_LOG_ERROR("parse_cell_sizes: no v_trans/n_layer\n"); return false; }
+    if (p + 8 > end) return false;
     uint32_t v_trans = ru32(p);
     uint32_t n_layer = ru32(p);
-    if (n_layer == 0) { LLAMA_LOG_ERROR("parse_cell_sizes: n_layer=0\n"); return false; }
+    if (n_layer == 0) return false;
 
     // Read per-layer sizes and compute bytes_per_cell
     // Also record where the header ends (the data section starts here)
@@ -4010,164 +4002,102 @@ static bool parse_cell_sizes(
     return true;
 }
 
-size_t llama_state_seq_get_n_cells(llama_context * ctx, llama_seq_id seq_id) {
-    ctx->synchronize();
-    size_t total_size = ctx->state_seq_get_size(seq_id, 0);
-    if (total_size == 0) return 0;
-
-    std::vector<uint8_t> buf(total_size);
-    size_t written = ctx->state_seq_get_data(seq_id, buf.data(), total_size, 0);
-    if (written != total_size) return 0;
-
-    size_t n_cells = 0, bpc = 0, hdr = 0;
-    if (!parse_cell_sizes(buf.data(), buf.size(), n_cells, bpc, hdr)) {
-        return 0;
-    }
-    return n_cells;
-}
-
-// cell_size_out: on first call set to 0, function writes the required size.
-// On subsequent calls, dst must be at least *cell_size_out bytes.
-// Returns the number of cells written to dst. If dst is NULL, only computes sizes.
-size_t llama_state_seq_get_cells(
-    llama_context * ctx,
-    llama_seq_id seq_id,
-    uint8_t * dst,
-    size_t * dst_sizes,
-    size_t max_cells)
+// Parse an already-serialized KV blob and extract per-cell tensor data.
+// Works on the captured blob directly — no re-serialization needed.
+size_t llama_state_seq_parse_blob(
+    const uint8_t * blob,
+    size_t blob_size,
+    uint8_t * cells_out,
+    size_t * cell_sizes_out,
+    size_t max_cells,
+    size_t * out_header_size)
 {
-    ctx->synchronize();
+    if (blob_size < 12) return 0;
 
-    size_t total_size = ctx->state_seq_get_size(seq_id, 0);
-    if (total_size == 0) return 0;
+    const uint8_t * p = blob;
+    const uint8_t * end = blob + blob_size;
 
-    std::vector<uint8_t> buf(total_size);
-    size_t written = ctx->state_seq_get_data(seq_id, buf.data(), total_size, 0);
-    if (written != total_size) return 0;
+    p += 8; // skip magic + seq_id
+    if (p + 4 > end) return 0;
+    uint32_t n_stream = 0; memcpy(&n_stream, p, 4); p += 4;
+    if (n_stream != 1) return 0; // only support n_stream=1 for now
 
-    const uint8_t * data = buf.data();
-    const uint8_t * end = data + buf.size();
+    if (p + 4 > end) return 0;
+    uint32_t cell_count = 0; memcpy(&cell_count, p, 4); p += 4;
+    if (cell_count == 0) return 0;
 
-    // Parse lengths
-    size_t n_cells = 0, bytes_per_cell = 0, header_size = 0;
-    if (!parse_cell_sizes(data, buf.size(), n_cells, bytes_per_cell, header_size)) {
-        return 0;
+    // Skip per-cell metadata
+    const uint8_t * meta_start = p;
+    for (uint32_t i = 0; i < cell_count; ++i) {
+        if (p + 8 > end) return 0;
+        p += 4; // pos
+        uint32_t n_seq_id = 0; memcpy(&n_seq_id, p, 4); p += 4;
+        p += n_seq_id * 4; // seq_ids
     }
+    const uint8_t * data_start = p; // start of data section
 
-    size_t nc = std::min(n_cells, max_cells);
+    if (p + 8 > end) return 0;
+    uint32_t v_trans = 0; memcpy(&v_trans, p, 4); p += 4;
+    if (v_trans != 0) return 0; // transposed values not supported
+    uint32_t n_layer = 0; memcpy(&n_layer, p, 4); p += 4;
+    if (n_layer == 0) return 0;
 
-    if (dst == NULL) {
-        // First pass: just return sizes
+    // Read per-layer sizes and locate where cell data starts
+    struct li { uint64_t kr; uint64_t vr; };
+    std::vector<li> layers;
+    for (uint32_t l = 0; l < n_layer; ++l) {
+        if (p + 12 > end) return 0;
+        p += 4; // k_type_i
+        uint64_t kr = 0; memcpy(&kr, p, 8); p += 8;
+        if (p + 12 > end) return 0;
+        p += 4; // v_type_i
+        uint64_t vr = 0; memcpy(&vr, p, 8); p += 8;
+        layers.push_back({kr, vr});
+    }
+    // p now points at the first key data byte
+    const uint8_t * cell_data_area = p;
+
+    // Compute bytes per cell
+    uint64_t bpc = 0;
+    for (const auto & l : layers) bpc += l.kr + l.vr;
+    if (bpc == 0) return 0;
+
+    // Verify cell data size
+    size_t data_size = blob_size - (size_t)(cell_data_area - blob);
+    if (data_size < cell_count * bpc) return 0;
+
+    // Compute header size
+    size_t hdr_size = (size_t)(cell_data_area - blob);
+    if (out_header_size) *out_header_size = hdr_size;
+
+    size_t nc = std::min((size_t)cell_count, max_cells);
+
+    if (cells_out == NULL) {
+        // First pass: just return cell sizes
         for (size_t i = 0; i < nc; ++i) {
-            dst_sizes[i] = bytes_per_cell;
+            cell_sizes_out[i] = (size_t)bpc;
         }
         return nc;
     }
 
-    // Full re-parse to extract per-cell data
-    const uint8_t * p = data + 8; // skip magic + seq_id
-    uint32_t n_stream = ru32(p);
-    uint32_t cell_count = ru32(p);
-
-    std::vector<uint32_t> n_seq_ids;
-    for (uint32_t i = 0; i < cell_count; ++i) {
-        p += 4; // pos
-        uint32_t ns = ru32(p);
-        n_seq_ids.push_back(ns);
-        p += ns * 4;
-    }
-
-    uint32_t v_trans = ru32(p);
-    uint32_t n_layer = ru32(p);
-
-    // Read per-layer sizes
-    struct layer_size { uint64_t k_row; uint64_t v_row; };
-    std::vector<layer_size> layers;
-    for (uint32_t l = 0; l < n_layer; ++l) {
-        (void)ri32(p); uint64_t kr = ru64(p);
-        if (!v_trans) {
-            (void)ri32(p); uint64_t vr = ru64(p);
-            layers.push_back({kr, vr});
-        } else {
-            (void)ri32(p); (void)ru32(p); (void)ru32(p);
-            layers.push_back({kr, 0}); // v_row not directly readable for v_trans
-        }
-    }
-
-    // p now points at start of cell data (after all type info)
-    const uint8_t * cell_data_start = p;
-
-    if (v_trans) {
-        // Can't extract per-cell data for transposed values easily — fall back
-        // to storing the entire data section as one cell
-        if (nc > 0) {
-            size_t cell_sz = buf.size() - (size_t)(cell_data_start - data);
-            if (dst_sizes[0] >= cell_sz) {
-                memcpy(dst, cell_data_start, cell_sz);
-                dst_sizes[0] = cell_sz;
-            }
-        }
-        return 1;
-    }
-
-    // For each cell, gather k+v rows across all layers
-    for (uint32_t i = 0; i < nc; ++i) {
-        uint8_t * cell_out = dst + (i > 0 ? dst_sizes[i-1] : 0);
-        size_t cell_pos = 0;
-
-        const uint8_t * dp = cell_data_start;
+    // Second pass: extract each cell's data
+    // Cells are stored per-cell: for each cell i, for each layer l: keys[l][i] + values[l][i]
+    // We need to read layer-major data and transpose to cell-major.
+    for (size_t i = 0; i < nc; ++i) {
+        uint8_t * out = cells_out + (i > 0 ? cell_sizes_out[i-1] : 0);
+        size_t opos = 0;
+        const uint8_t * dp = cell_data_area;
         for (uint32_t l = 0; l < n_layer; ++l) {
-            // This cell's key row for this layer
-            size_t k_off = i * layers[l].k_row;
-            memcpy(cell_out + cell_pos, dp + k_off, layers[l].k_row);
-            cell_pos += layers[l].k_row;
-
-            dp += cell_count * layers[l].k_row;
-
-            // This cell's value row for this layer
-            size_t v_off = i * layers[l].v_row;
-            memcpy(cell_out + cell_pos, dp + v_off, layers[l].v_row);
-            cell_pos += layers[l].v_row;
-
-            dp += cell_count * layers[l].v_row;
+            memcpy(out + opos, dp + i * layers[l].kr, layers[l].kr);
+            opos += layers[l].kr;
+            dp += cell_count * layers[l].kr;
+            memcpy(out + opos, dp + i * layers[l].vr, layers[l].vr);
+            opos += layers[l].vr;
+            dp += cell_count * layers[l].vr;
         }
-
-        dst_sizes[i] = (uint32_t)cell_pos;
+        cell_sizes_out[i] = opos;
     }
-
     return nc;
-}
-
-size_t llama_state_seq_set_cells(
-    llama_context * ctx,
-    llama_seq_id dest_seq_id,
-    size_t n_cells,
-    const size_t * cell_sizes,
-    const uint8_t * cell_data)
-{
-    ctx->synchronize();
-
-    // We need to rebuild the full blob. First get the empty blob size
-    // and structure, then fill in cell data.
-    size_t total_size = ctx->state_seq_get_size(dest_seq_id, 0);
-    if (total_size == 0) return 0;
-
-    // Serialize an empty sequence to get the header structure
-    // We need to decode the header from the current KV cache
-    // Actually, we can't easily rebuild without parsing the cache structure.
-    // For now, fall back to the old method: write cell data back
-    // by concatenating them in layer-major order and prepending the header.
-
-    // The header is stored separately by the checkpoint DB.
-    // But this function only receives cell data.
-    // We need the header to reconstruct. This means the checkpoint DB
-    // must provide the header alongside cell data.
-
-    // For now, just return 0 to indicate "not supported yet".
-    // The checkpoint DB will fall back to the old .kv file method.
-    (void)n_cells; (void)cell_sizes; (void)cell_data;
-    LLAMA_LOG_ERROR("%s: not yet implemented — use set_data_ext instead\n", __func__);
-    return 0;
 }
 
 ///
